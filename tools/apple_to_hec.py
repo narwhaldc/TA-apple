@@ -266,6 +266,8 @@ def explode(payload, tgt):
     dayvit = collections.defaultdict(lambda: collections.defaultdict(list))  # values to avg
     events = []
     unmapped = set()
+    extra = collections.defaultdict(list)   # (metric, day, vendor) -> [values]; unmapped -> apple:extra
+    extra_units = {}
 
     for metric in metrics:
         name = metric.get("name")
@@ -275,7 +277,19 @@ def explode(payload, tgt):
             continue
         route = METRIC_MAP.get(name)
         if not route:
-            unmapped.add(name); continue
+            # no canonical mapping -> keep it anyway in the generic apple:extra bucket
+            unmapped.add(name)
+            for s in metric.get("data") or []:
+                vendor = source_to_vendor(s.get("source"))
+                if vendor in tgt["skip_sources"]:
+                    continue
+                _, day = parse_dt(s.get("date"))
+                v = sample_value(s)
+                if day is None or not isinstance(v, (int, float)):
+                    continue
+                extra[(name, day, vendor)].append(v)
+                extra_units[name] = units
+            continue
         st, field, kind = route
         for s in metric.get("data") or []:
             vendor = source_to_vendor(s.get("source"))
@@ -318,9 +332,20 @@ def explode(payload, tgt):
         ev.update({"day": day, "_vendor": vendor})
         events.append(("apple:daily", _midnight(day), ev))
 
+    # flush unmapped metrics into the generic apple:extra bucket (one row per metric/day/vendor,
+    # multi-stat so the consumer picks: avg for rates, sum for totals, count for events).
+    for (metric, day, vendor), vals in extra.items():
+        if not vals:
+            continue
+        events.append(("apple:extra", _midnight(day), {
+            "metric": metric, "units": extra_units.get(metric),
+            "count": len(vals), "sum": round(sum(vals), 3),
+            "avg": round(sum(vals) / len(vals), 3), "min": min(vals), "max": max(vals),
+            "day": day, "_vendor": vendor}))
+
     events += _workout_events((payload.get("data") or {}).get("workouts") or [], tgt)
     if unmapped:
-        print(f"    [info] {len(unmapped)} unmapped metric(s) skipped: {', '.join(sorted(unmapped))}")
+        print(f"    [info] {len(unmapped)} unmapped metric(s) -> apple:extra: {', '.join(sorted(unmapped))}")
     return events
 
 
