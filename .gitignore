@@ -1,0 +1,51 @@
+# secrets / tokens — NEVER commit. Bare names match at ANY depth (repo ROOT and
+# tools/); **/ forms are explicit belt-and-suspenders so root-level creds can't leak.
+.env
+/.env
+**/.env
+# HEC targets (holds hec_token) — never commit (root and any subdir)
+apple_targets.json
+**/apple_targets.json
+# optional Linux+iCloud (pyicloud) session cache + Apple app-password store
+.pyicloud/
+**/.pyicloud/
+*apple_session*.json
+apple_icloud_token.json
+
+# personal health exports (PHI) — never commit
+apple_samples/
+tools/apple_samples/
+*.HealthAutoExport*.json
+HealthAutoExport*.json
+
+# BELT-AND-SUSPENDERS: no data files anywhere under tools/ (the ONLY tracked file
+# there is apple_to_hec.py). Blocks any stray HAE export / sample / runtime-state
+# file from leaking PHI or tokens into the repo via the tools/ vector.
+tools/*.json
+tools/*.csv
+tools/*.ndjson
+tools/*.jsonl
+tools/*.xml
+# also catch health/token files dropped at repo root
+*.ndjson
+*.jsonl
+export*.json
+metrics*.json
+
+# runtime state (never commit)
+apple_checkpoint.json
+apple_dedup_store.json
+apple_sync.lock
+*.lock
+*.tmp
+*.log
+
+# build artifacts / editor junk
+*.spl
+__pycache__/
+*.pyc
+*.swp
+*.swo
+.*.sw?
+*~
+.DS_Store

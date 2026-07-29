@@ -1,0 +1,27 @@
+{
+  "_comment": "Copy to tools/apple_targets.json (gitignored) and fill in. One entry per person/iPhone. The puller reads JSON export files from watch_dir (wherever your sync client drops them) and delivers to HEC. Only secret here is hec_token — the sync client (iCloud/Dropbox) owns cloud auth outside this file.",
+  "targets": {
+    "tony": {
+      "hec_url": "https://YOUR-SPLUNK-HOST:8088/services/collector/event",
+      "hec_token": "PUT-HEC-TOKEN-HERE",
+      "index": "wearables",
+      "person_id": "P001",
+      "verify_ssl": true,
+
+      "watch_dir": "~/Library/Mobile Documents/com~apple~CloudDocs/HealthAutoExport",
+      "_watch_dir_note": "Mac+iCloud example above. Linux+Dropbox e.g. ~/Dropbox/HealthAutoExport. Any folder your sync client writes HAE JSON files into.",
+
+      "file_glob": "*.json",
+      "delete_after_ingest": true,
+      "archive_dir": null,
+      "_archive_note": "Set archive_dir to a LOCAL (non-cloud) path to move processed files there instead of deleting (safety window); prune it yourself. delete_after_ingest is ignored when archive_dir is set.",
+
+      "min_file_age_seconds": 60,
+      "skip_sources": [],
+      "_skip_sources_note": "Empty = ingest everything (Apple-hub mode). To avoid double-counting a vendor you ALSO pull directly, add its source keyword, e.g. [\"Oura\"]. Matched case-insensitively against each sample's HealthKit source.",
+
+      "hr_firehose": false,
+      "_hr_firehose_note": "false = skip the per-minute heart_rate samples (we already get resting_heart_rate daily). true = also emit apple:heartrate per-sample bpm (high volume)."
+    }
+  }
+}

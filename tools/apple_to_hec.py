@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""
+apple_to_hec.py — TA-apple ingest (Health Auto Export -> synced folder -> Splunk HEC).
+
+Apple Health / HealthKit is on-device only (no cloud API). The iOS app "Health
+Auto Export" (HAE) writes JSON export files to a folder your sync client keeps
+current (iCloud Drive on a Mac, Dropbox on Linux, an NFS/SMB mount, etc.). This
+script PULLS those files from a plain directory, explodes them into clean
+per-record CANONICAL events, and delivers them to HEC (index=wearables).
+
+Design notes (see INSTALL.md):
+  * Folder-agnostic + pure-Python (json + requests) -> runs on Linux or macOS.
+    It does NOT talk to iCloud/Dropbox; the sync client owns that auth. The only
+    secret this script needs is the HEC token (apple_targets.json / .env).
+  * Apple Health is an AGGREGATOR: each sample carries its origin `source`
+    (e.g. "Oura", "Narwhal Ultra 2", "Narwhal Ultra 2|Oura"). We rename that to
+    `hk_source` (`source` is a RESERVED Splunk field) and derive canonical
+    `vendor` from it. `skip_sources` (default empty) lets you drop a vendor you
+    also pull with its own TA, to avoid double-counting.
+  * Units are locale-dependent (kg/lb, km/mi) -> converted to SI (kg, meters).
+  * Apple calls light sleep `core` -> mapped to light_min.
+  * Per-minute heart_rate firehose is OFF by default (we already get
+    resting_heart_rate daily); enable with hr_firehose.
+  * File lifecycle: skip in-flight/placeholder files -> parse -> explode ->
+    dedup -> POST -> delete (or archive). Nothing is deleted until every POST
+    for the run returns 200, so a failed run just retries next time.
+
+Config: apple_targets.json (preferred) or env SPLUNK_HEC_URL/TOKEN + APPLE_*.
+CLI: --status  --dry-run  --keep(archive/keep files)  --file PATH  --target NAME
+     --person PID
+"""
+
+import argparse, atexit, collections, datetime, fcntl, glob, hashlib, json, os, sys, time
+from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    sys.exit("missing dependency: pip install requests")
+
+HERE = Path(__file__).resolve().parent
+
+
+# ------------------------------------------------------------------ .env autoload
+def load_dotenv():
+    """Populate os.environ from a local .env (KEY=VALUE) next to this script.
+    Existing env wins; a leading 'export ' and surrounding quotes are stripped.
+    .env is gitignored (it may hold the HEC token) — never commit it."""
+    path = HERE / ".env"
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key, val = key.strip(), val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except IOError:
+        pass
+
+
+load_dotenv()
+
+TARGETS_FILE = Path(os.getenv("APPLE_TARGETS_FILE", HERE / "apple_targets.json"))
+DEDUP_FILE   = Path(os.getenv("APPLE_DEDUP_FILE",   HERE / "apple_dedup_store.json"))
+LOCK_FILE    = Path(os.getenv("APPLE_LOCK_FILE",    HERE / "apple_sync.lock"))
+DEDUP_MAX    = int(os.getenv("APPLE_DEDUP_MAX", "50000"))
+
+
+# ------------------------------------------------------------------ targets
+def load_targets(target_filter=None):
+    """File first (apple_targets.json), else a single env 'default' target."""
+    targets = {}
+    if TARGETS_FILE.exists():
+        try:
+            raw = json.loads(TARGETS_FILE.read_text()).get("targets", {})
+        except Exception as e:
+            sys.exit(f"failed to read {TARGETS_FILE}: {e}")
+        for name, cfg in raw.items():
+            if name.startswith("_"):
+                continue
+            if not cfg.get("hec_url") or not cfg.get("hec_token"):
+                print(f"[warn] target '{name}' missing hec_url/hec_token — skipping"); continue
+            if not cfg.get("person_id"):
+                print(f"[warn] target '{name}' has no person_id — required for wearables RBAC")
+            targets[name] = _norm_target(cfg)
+    else:
+        url, tok = os.getenv("SPLUNK_HEC_URL"), os.getenv("SPLUNK_HEC_TOKEN")
+        if url and tok:
+            targets["default"] = _norm_target({
+                "hec_url": url, "hec_token": tok,
+                "index": os.getenv("WEARABLES_INDEX", "wearables"),
+                "person_id": os.getenv("APPLE_PERSON_ID", "P001"),
+                "verify_ssl": os.getenv("SPLUNK_HEC_VERIFY", "1") != "0",
+                "watch_dir": os.getenv("APPLE_WATCH_DIR", ""),
+            })
+    if not targets:
+        sys.exit(f"no targets: create {TARGETS_FILE} (see apple_targets.example.json) "
+                 f"or set SPLUNK_HEC_URL + SPLUNK_HEC_TOKEN + APPLE_WATCH_DIR")
+    if target_filter:
+        if target_filter not in targets:
+            sys.exit(f"target '{target_filter}' not found. have: {list(targets)}")
+        targets = {target_filter: targets[target_filter]}
+    return targets
+
+
+def _norm_target(cfg):
+    wd = os.path.expanduser(cfg.get("watch_dir", "") or "")
+    ad = cfg.get("archive_dir")
+    return {
+        "hec_url": cfg["hec_url"], "hec_token": cfg["hec_token"],
+        "index": cfg.get("index", "wearables"),
+        "person_id": cfg.get("person_id"),
+        "verify_ssl": cfg.get("verify_ssl", True),
+        "watch_dir": wd,
+        "file_glob": cfg.get("file_glob", "*.json"),
+        "delete_after_ingest": bool(cfg.get("delete_after_ingest", True)),
+        "archive_dir": os.path.expanduser(ad) if ad else None,
+        "min_file_age_seconds": int(cfg.get("min_file_age_seconds", 60)),
+        "skip_sources": [s.lower() for s in cfg.get("skip_sources", [])],
+        "hr_firehose": bool(cfg.get("hr_firehose", False)),
+    }
+
+
+# ------------------------------------------------------------------ state / dedup
+def load_json(path, default):
+    if path.exists():
+        try: return json.loads(path.read_text())
+        except Exception as e: print(f"[warn] could not read {path} ({e}); fresh")
+    return default
+
+def save_json(path, obj):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj, separators=(",", ":"), default=str))
+    tmp.replace(path)
+
+def _hash(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()
+
+
+# ------------------------------------------------------------------ mapping helpers
+VENDOR_KEYWORDS = [("oura", "oura"), ("garmin", "garmin"), ("withings", "withings"),
+                   ("fitbit", "fitbit"), ("whoop", "whoop"), ("polar", "polar"),
+                   ("wahoo", "wahoo"), ("peloton", "peloton")]
+
+def source_to_vendor(hk_source):
+    """Map an Apple HealthKit source string to a canonical vendor. A pipe-delimited
+    multi-source (e.g. 'Narwhal Ultra 2|Oura') is Apple's merged view -> apple."""
+    raw = hk_source or ""
+    if "|" in raw:
+        return "apple"
+    s = raw.lower()
+    for kw, v in VENDOR_KEYWORDS:
+        if kw in s:
+            return v
+    return "apple"
+
+def to_kg(qty, units):
+    u = (units or "").lower()
+    if u in ("lb", "lbs", "pound", "pounds"): return qty * 0.45359237
+    if u in ("g", "gram", "grams"):           return qty / 1000.0
+    if u in ("st", "stone"):                  return qty * 6.35029318
+    return qty  # already kg
+
+def to_meters(qty, units):
+    u = (units or "").lower()
+    if u in ("mi", "mile", "miles"): return qty * 1609.344
+    if u in ("km",):                 return qty * 1000.0
+    if u in ("ft", "feet"):          return qty * 0.3048
+    if u in ("yd", "yard", "yards"): return qty * 0.9144
+    return qty  # already m
+
+def as_pct(qty):
+    """Apple can express % as a fraction (0.97) or a number (97). Normalize to 0-100."""
+    return qty * 100.0 if (qty is not None and qty <= 1.0) else qty
+
+def to_celsius(qty, units):
+    u = (units or "").lower().replace("°", "")
+    if u in ("degf", "f", "fahrenheit"): return (qty - 32.0) * 5.0 / 9.0
+    if u in ("degk", "k", "kelvin"):     return qty - 273.15
+    return qty  # already C
+
+def sample_value(sample):
+    """Most samples use 'qty'; HR-style samples use Avg/Min/Max."""
+    if sample.get("qty") is not None:
+        return sample["qty"]
+    return sample.get("Avg")
+
+def parse_dt(s):
+    """'2026-07-29 08:00:00 -0400' -> (epoch, 'YYYY-MM-DD')."""
+    if not s:
+        return None, None
+    try:
+        dt = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S %z")
+    except ValueError:
+        try:
+            dt = datetime.datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None, None
+    return dt.timestamp(), dt.strftime("%Y-%m-%d")
+
+
+# name -> (sourcetype, canonical_field, kind)
+# kinds: sum_daily, sum_daily_dist, avg_daily, avg_daily_pct,
+#        bodycomp, bodycomp_mass, bodycomp_pct, hr_firehose
+METRIC_MAP = {
+    "step_count":                 ("apple:activity", "steps",            "sum_daily"),
+    "walking_running_distance":   ("apple:activity", "distance_m",       "sum_daily_dist"),
+    "active_energy":              ("apple:activity", "active_calories",  "sum_daily"),
+    "basal_energy_burned":        ("apple:activity", "basal_calories",   "sum_daily"),
+    "apple_exercise_time":        ("apple:activity", "active_min",       "sum_daily"),
+    "flights_climbed":            ("apple:activity", "floors",           "sum_daily"),
+    "resting_heart_rate":         ("apple:daily",    "resting_hr",       "avg_daily"),
+    "heart_rate_variability":     ("apple:daily",    "hrv_avg",          "avg_daily"),
+    "respiratory_rate":           ("apple:daily",    "respiration_avg",  "avg_daily"),
+    "blood_oxygen_saturation":    ("apple:daily",    "spo2_avg",         "avg_daily_pct"),
+    "apple_sleeping_wrist_temperature": ("apple:daily", "skin_temp",     "avg_daily_temp"),
+    "walking_heart_rate_average": ("apple:daily",    "walking_hr_avg",   "avg_daily"),
+    "vo2_max":                    ("apple:daily",    "vo2max",           "avg_daily"),
+    "weight_body_mass":           ("apple:bodycomp", "weight_kg",        "bodycomp_mass"),
+    "body_mass_index":            ("apple:bodycomp", "bmi",              "bodycomp"),
+    "body_fat_percentage":        ("apple:bodycomp", "body_fat_pct",     "bodycomp_pct"),
+    "lean_body_mass":             ("apple:bodycomp", "lean_mass_kg",     "bodycomp_mass"),
+    "heart_rate":                 ("apple:heartrate","bpm",              "hr_firehose"),
+}
+
+
+# ------------------------------------------------------------------ explode one payload
+def explode(payload, tgt):
+    """Turn one HAE JSON payload into a list of (sourcetype, epoch, event_dict).
+    Aggregates day+vendor totals/averages; emits body-comp & sleep per record."""
+    metrics = (payload.get("data") or {}).get("metrics") or []
+    # accumulators keyed by (day, vendor)
+    act = collections.defaultdict(dict)                 # sum fields
+    dayvit = collections.defaultdict(lambda: collections.defaultdict(list))  # values to avg
+    events = []
+    unmapped = set()
+
+    for metric in metrics:
+        name = metric.get("name")
+        units = metric.get("units")
+        if name == "sleep_analysis":
+            events += _sleep_events(metric, tgt)
+            continue
+        route = METRIC_MAP.get(name)
+        if not route:
+            unmapped.add(name); continue
+        st, field, kind = route
+        for s in metric.get("data") or []:
+            vendor = source_to_vendor(s.get("source"))
+            if vendor in tgt["skip_sources"]:
+                continue
+            epoch, day = parse_dt(s.get("date"))
+            if day is None:
+                continue
+            v = sample_value(s)
+            if v is None:
+                continue
+            key = (day, vendor)
+            if kind == "sum_daily":
+                act[key][field] = act[key].get(field, 0) + v
+            elif kind == "sum_daily_dist":
+                act[key][field] = act[key].get(field, 0) + to_meters(v, units)
+            elif kind == "avg_daily":
+                dayvit[key][field].append(v)
+            elif kind == "avg_daily_pct":
+                dayvit[key][field].append(as_pct(v))
+            elif kind == "avg_daily_temp":
+                dayvit[key][field].append(to_celsius(v, units))
+            elif kind.startswith("bodycomp"):
+                val = to_kg(v, units) if kind == "bodycomp_mass" else (as_pct(v) if kind == "bodycomp_pct" else v)
+                events.append((st, epoch, {field: round(val, 2), "day": day,
+                                           "hk_source": s.get("source", ""), "_vendor": vendor}))
+            elif kind == "hr_firehose":
+                if tgt["hr_firehose"]:
+                    events.append((st, epoch, {"bpm": v, "day": day,
+                                               "hk_source": s.get("source", ""), "_vendor": vendor}))
+
+    # flush activity sums (one apple:activity event per day+vendor)
+    for (day, vendor), fields in act.items():
+        ev = {k: (round(x) if k in ("steps", "floors") else round(x, 2)) for k, x in fields.items()}
+        ev.update({"day": day, "_vendor": vendor})
+        events.append(("apple:activity", _midnight(day), ev))
+    # flush daily vitals averages (one apple:daily event per day+vendor)
+    for (day, vendor), fields in dayvit.items():
+        ev = {k: round(sum(vs) / len(vs), 2) for k, vs in fields.items() if vs}
+        ev.update({"day": day, "_vendor": vendor})
+        events.append(("apple:daily", _midnight(day), ev))
+
+    if unmapped:
+        print(f"    [info] {len(unmapped)} unmapped metric(s) skipped: {', '.join(sorted(unmapped))}")
+    return events
+
+
+def _sleep_events(metric, tgt):
+    """sleep_analysis -> one apple:sleep event per night. Apple 'core' = light."""
+    out = []
+    for s in metric.get("data") or []:
+        vendor = source_to_vendor(s.get("source"))
+        if vendor in tgt["skip_sources"]:
+            continue
+        start_epoch, _ = parse_dt(s.get("sleepStart") or s.get("inBedStart"))
+        _, day = parse_dt(s.get("date") or s.get("sleepStart"))
+        h = lambda k: round((s.get(k) or 0) * 60.0, 1)   # hours -> minutes
+        tib = None
+        ib0, _ = parse_dt(s.get("inBedStart"))
+        ib1, _ = parse_dt(s.get("inBedEnd"))
+        if ib0 and ib1 and ib1 > ib0:
+            tib = round((ib1 - ib0) / 60.0, 1)
+        total = h("totalSleep")
+        ev = {"total_sleep_min": total, "deep_min": h("deep"), "rem_min": h("rem"),
+              "light_min": h("core"), "awake_min": h("awake"), "day": day,
+              "sleep_type": "long_sleep", "hk_source": s.get("source", ""), "_vendor": vendor}
+        if tib:
+            ev["time_in_bed_min"] = tib
+            ev["efficiency_pct"] = round(100.0 * total / tib, 1) if tib else None
+        out.append(("apple:sleep", start_epoch or _midnight(day), ev))
+    return out
+
+
+def _midnight(day):
+    try:
+        return time.mktime(datetime.datetime.strptime(day, "%Y-%m-%d").timetuple())
+    except Exception:
+        return time.time()
+
+
+# ------------------------------------------------------------------ HEC
+def to_hec(tgt, sourcetype, epoch, ev):
+    vendor = ev.pop("_vendor", "apple")
+    return {"time": epoch if epoch else time.time(), "event": ev, "sourcetype": sourcetype,
+            "index": tgt["index"], "source": "health_auto_export",
+            "fields": {"vendor": vendor, "person_id": tgt["person_id"]}}
+
+def hec_send(tgt, batch):
+    body = "".join(json.dumps(e) for e in batch)
+    verify = tgt.get("verify_ssl", True) if tgt["hec_url"].startswith("https") else False
+    r = requests.post(tgt["hec_url"], data=body,
+                      headers={"Authorization": f"Splunk {tgt['hec_token']}"},
+                      verify=verify, timeout=120)
+    r.raise_for_status()
+
+
+# ------------------------------------------------------------------ file discovery
+def is_icloud_placeholder(p):
+    """macOS iCloud can evict a file to a 0-byte '.name.icloud' stub. Best-effort
+    trigger a download; only relevant on Darwin."""
+    if sys.platform != "darwin":
+        return False
+    stub = p.parent / ("." + p.name + ".icloud")
+    if stub.exists():
+        os.system(f"brctl download {json.dumps(str(stub))} >/dev/null 2>&1")
+        time.sleep(2)
+        return not p.exists()
+    return False
+
+def discover_files(tgt):
+    wd = tgt["watch_dir"]
+    if not wd or not os.path.isdir(wd):
+        sys.exit(f"watch_dir not found: {wd!r} — set it in apple_targets.json")
+    now = time.time()
+    files = []
+    for path in sorted(glob.glob(os.path.join(wd, tgt["file_glob"]))):
+        p = Path(path)
+        if is_icloud_placeholder(p):
+            print(f"    [skip] iCloud placeholder not yet downloaded: {p.name}"); continue
+        try:
+            age = now - p.stat().st_mtime
+        except OSError:
+            continue
+        if age < tgt["min_file_age_seconds"]:
+            print(f"    [skip] too new ({int(age)}s, still syncing?): {p.name}"); continue
+        files.append(p)
+    return files
+
+def finish_file(tgt, p, dry):
+    if dry:
+        return
+    if tgt["archive_dir"]:
+        os.makedirs(tgt["archive_dir"], exist_ok=True)
+        p.replace(Path(tgt["archive_dir"]) / p.name)
+    elif tgt["delete_after_ingest"]:
+        try: p.unlink()
+        except OSError as e: print(f"    [warn] could not delete {p.name}: {e}")
+
+
+# ------------------------------------------------------------------ per-target run
+def run_target(name, tgt, store, args):
+    print(f"[target {name}] person_id={tgt['person_id']} watch_dir={tgt['watch_dir']}")
+    files = [Path(args.file)] if args.file else discover_files(tgt)
+    if not files:
+        print("    no files to process"); return 0, 0
+    tstore = store.setdefault(name, {})
+    sent = skipped = 0
+    for p in files:
+        try:
+            payload = json.loads(p.read_text())
+        except Exception as e:
+            print(f"    [skip] unparseable (retry next run): {p.name} ({e})"); continue
+        events = explode(payload, tgt)
+        batch, ok = [], True
+        for st, epoch, ev in events:
+            h = _hash({"st": st, "p": tgt["person_id"], "ev": ev, "t": int(epoch or 0)})
+            if h in tstore:
+                skipped += 1; continue
+            batch.append((h, to_hec(tgt, st, epoch, dict(ev))))
+        print(f"    {p.name}: {len(events)} events -> {len(batch)} new, {len(events)-len(batch)} dupes")
+        # send in chunks of 200
+        for i in range(0, len(batch), 200):
+            chunk = batch[i:i+200]
+            if args.dry_run:
+                continue
+            try:
+                hec_send(tgt, [e for _, e in chunk])
+            except Exception as e:
+                print(f"    [error] HEC send failed ({e}); leaving {p.name} for retry"); ok = False; break
+            for h, _ in chunk:
+                tstore[h] = 1
+            sent += len(chunk)
+        if ok and not args.dry_run:
+            finish_file(tgt, p, dry=args.keep)
+            if not args.keep:
+                print(f"    {'archived' if tgt['archive_dir'] else 'deleted'}: {p.name}")
+    return sent, skipped
+
+
+# ------------------------------------------------------------------ main
+def main():
+    ap = argparse.ArgumentParser(description="Apple Health (HAE) file-drop -> HEC")
+    ap.add_argument("--target", help="only this target from apple_targets.json")
+    ap.add_argument("--file", help="ingest a single specific file (ignores watch_dir discovery)")
+    ap.add_argument("--person", help="override person_id for all targets (testing)")
+    ap.add_argument("--dry-run", action="store_true", help="parse + report, no HEC send, no delete")
+    ap.add_argument("--keep", action="store_true", help="do not delete/archive processed files")
+    ap.add_argument("--status", action="store_true", help="show dedup store summary and exit")
+    ap.add_argument("--reset-dedup", action="store_true", help="clear the dedup store")
+    args = ap.parse_args()
+
+    if args.reset_dedup and DEDUP_FILE.exists():
+        DEDUP_FILE.unlink(); print(f"dedup store cleared ({DEDUP_FILE})")
+
+    targets = load_targets(args.target)
+    if args.person:
+        for t in targets.values():
+            t["person_id"] = args.person
+        print(f"[override] person_id -> {args.person} for all targets")
+
+    store = load_json(DEDUP_FILE, {})
+    if args.status:
+        print(f"targets: {', '.join(targets)}")
+        for n in targets:
+            print(f"  {n}: {len(store.get(n, {}))} deduped records")
+        return
+
+    # single-instance lock (cron + manual can't corrupt the dedup store)
+    lock_fp = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(f"another instance is running (lock: {LOCK_FILE}). exiting.")
+    atexit.register(lambda: (fcntl.flock(lock_fp, fcntl.LOCK_UN), lock_fp.close()))
+
+    total_sent = total_skip = 0
+    for name, tgt in targets.items():
+        s, k = run_target(name, tgt, store, args)
+        total_sent += s; total_skip += k
+
+    # prune + persist dedup store
+    for n, d in store.items():
+        if len(d) > DEDUP_MAX:
+            store[n] = dict(list(d.items())[-DEDUP_MAX:])
+    if not args.dry_run:
+        save_json(DEDUP_FILE, store)
+    print(f"done: {total_sent} events sent, {total_skip} deduped"
+          f"{' (dry-run)' if args.dry_run else ''}")
+
+
+if __name__ == "__main__":
+    main()
