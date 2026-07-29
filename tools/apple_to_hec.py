@@ -450,7 +450,18 @@ def main():
         fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         sys.exit(f"another instance is running (lock: {LOCK_FILE}). exiting.")
-    atexit.register(lambda: (fcntl.flock(lock_fp, fcntl.LOCK_UN), lock_fp.close()))
+    def _release_lock():
+        # Unlock + close + remove the lock FILE on clean exit. Registered only after
+        # we hold the flock, so a losing instance can't delete another's lock. On a
+        # hard crash the file may linger, but flock auto-releases on process death so
+        # the next run just re-acquires it.
+        try: fcntl.flock(lock_fp, fcntl.LOCK_UN)
+        except Exception: pass
+        try: lock_fp.close()
+        except Exception: pass
+        try: os.unlink(LOCK_FILE)
+        except OSError: pass
+    atexit.register(_release_lock)
 
     print(f"[source] watch_dir={source['watch_dir']}  targets={', '.join(targets)}")
     files = [Path(args.file)] if args.file else discover_files(source)
