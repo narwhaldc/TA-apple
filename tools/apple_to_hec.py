@@ -73,16 +73,22 @@ LOCK_FILE    = Path(os.getenv("APPLE_LOCK_FILE",    HERE / "apple_sync.lock"))
 DEDUP_MAX    = int(os.getenv("APPLE_DEDUP_MAX", "50000"))
 
 
-# ------------------------------------------------------------------ targets
-def load_targets(target_filter=None):
-    """File first (apple_targets.json), else a single env 'default' target."""
-    targets = {}
+# ------------------------------------------------------------------ config (source + targets)
+def load_config(target_filter=None):
+    """Returns (source_cfg, targets). The file SOURCE (watch_dir + archive/lifecycle)
+    is ONE top-level 'source' block shared by all targets: each file is read once,
+    fanned out to EVERY target, and cleaned up ONCE (only after all targets succeed).
+    Targets are pure destinations (hec_*, index, person_id, verify_ssl, skip_sources,
+    hr_firehose). Back-compat: if there is no top-level 'source', it is derived from
+    the first target that still carries watch_dir (with a deprecation note)."""
     if TARGETS_FILE.exists():
         try:
-            raw = json.loads(TARGETS_FILE.read_text()).get("targets", {})
+            raw = json.loads(TARGETS_FILE.read_text())
         except Exception as e:
             sys.exit(f"failed to read {TARGETS_FILE}: {e}")
-        for name, cfg in raw.items():
+        raw_targets = raw.get("targets", {})
+        targets = {}
+        for name, cfg in raw_targets.items():
             if name.startswith("_"):
                 continue
             if not cfg.get("hec_url") or not cfg.get("hec_token"):
@@ -90,41 +96,60 @@ def load_targets(target_filter=None):
             if not cfg.get("person_id"):
                 print(f"[warn] target '{name}' has no person_id — required for wearables RBAC")
             targets[name] = _norm_target(cfg)
+        src_raw = raw.get("source")
+        if src_raw is None:
+            for name, cfg in raw_targets.items():
+                if cfg.get("watch_dir"):
+                    print(f"[note] no top-level 'source' block — using watch_dir/archive_dir "
+                          f"from target '{name}'. Move these to a shared top-level 'source' "
+                          f"block (see apple_targets.example.json) so every target gets the data.")
+                    src_raw = cfg; break
+        source = _norm_source(src_raw or {})
     else:
         url, tok = os.getenv("SPLUNK_HEC_URL"), os.getenv("SPLUNK_HEC_TOKEN")
-        if url and tok:
-            targets["default"] = _norm_target({
-                "hec_url": url, "hec_token": tok,
-                "index": os.getenv("WEARABLES_INDEX", "wearables"),
-                "person_id": os.getenv("APPLE_PERSON_ID", "P001"),
-                "verify_ssl": os.getenv("SPLUNK_HEC_VERIFY", "1") != "0",
-                "watch_dir": os.getenv("APPLE_WATCH_DIR", ""),
-            })
+        if not (url and tok):
+            sys.exit(f"no config: create {TARGETS_FILE} (see apple_targets.example.json) "
+                     f"or set SPLUNK_HEC_URL + SPLUNK_HEC_TOKEN + APPLE_WATCH_DIR")
+        targets = {"default": _norm_target({
+            "hec_url": url, "hec_token": tok,
+            "index": os.getenv("WEARABLES_INDEX", "wearables"),
+            "person_id": os.getenv("APPLE_PERSON_ID", "P001"),
+            "verify_ssl": os.getenv("SPLUNK_HEC_VERIFY", "1") != "0"})}
+        source = _norm_source({"watch_dir": os.getenv("APPLE_WATCH_DIR", ""),
+                               "archive_dir": os.getenv("APPLE_ARCHIVE_DIR")})
     if not targets:
-        sys.exit(f"no targets: create {TARGETS_FILE} (see apple_targets.example.json) "
-                 f"or set SPLUNK_HEC_URL + SPLUNK_HEC_TOKEN + APPLE_WATCH_DIR")
+        sys.exit(f"no targets in {TARGETS_FILE}")
+    if not source["watch_dir"]:
+        sys.exit("no watch_dir: add a top-level 'source' block with watch_dir "
+                 "(see apple_targets.example.json)")
     if target_filter:
         if target_filter not in targets:
             sys.exit(f"target '{target_filter}' not found. have: {list(targets)}")
         targets = {target_filter: targets[target_filter]}
-    return targets
+    return source, targets
 
 
 def _norm_target(cfg):
-    wd = os.path.expanduser(cfg.get("watch_dir", "") or "")
-    ad = cfg.get("archive_dir")
+    """A DESTINATION: where to send + how to attribute/filter. No file lifecycle here."""
     return {
         "hec_url": cfg["hec_url"], "hec_token": cfg["hec_token"],
         "index": cfg.get("index", "wearables"),
         "person_id": cfg.get("person_id"),
         "verify_ssl": cfg.get("verify_ssl", True),
-        "watch_dir": wd,
+        "skip_sources": [s.lower() for s in cfg.get("skip_sources", [])],
+        "hr_firehose": bool(cfg.get("hr_firehose", False)),
+    }
+
+
+def _norm_source(cfg):
+    """The shared file folder + lifecycle, common to all targets."""
+    ad = cfg.get("archive_dir")
+    return {
+        "watch_dir": os.path.expanduser(cfg.get("watch_dir", "") or ""),
         "file_glob": cfg.get("file_glob", "*.json"),
         "delete_after_ingest": bool(cfg.get("delete_after_ingest", True)),
         "archive_dir": os.path.expanduser(ad) if ad else None,
         "min_file_age_seconds": int(cfg.get("min_file_age_seconds", 60)),
-        "skip_sources": [s.lower() for s in cfg.get("skip_sources", [])],
-        "hr_firehose": bool(cfg.get("hr_firehose", False)),
     }
 
 
@@ -360,13 +385,13 @@ def is_icloud_placeholder(p):
         return not p.exists()
     return False
 
-def discover_files(tgt):
-    wd = tgt["watch_dir"]
+def discover_files(source):
+    wd = source["watch_dir"]
     if not wd or not os.path.isdir(wd):
-        sys.exit(f"watch_dir not found: {wd!r} — set it in apple_targets.json")
+        sys.exit(f"watch_dir not found: {wd!r} — set it in the 'source' block of apple_targets.json")
     now = time.time()
     files = []
-    for path in sorted(glob.glob(os.path.join(wd, tgt["file_glob"]))):
+    for path in sorted(glob.glob(os.path.join(wd, source["file_glob"]))):
         p = Path(path)
         if is_icloud_placeholder(p):
             print(f"    [skip] iCloud placeholder not yet downloaded: {p.name}"); continue
@@ -374,67 +399,28 @@ def discover_files(tgt):
             age = now - p.stat().st_mtime
         except OSError:
             continue
-        if age < tgt["min_file_age_seconds"]:
+        if age < source["min_file_age_seconds"]:
             print(f"    [skip] too new ({int(age)}s, still syncing?): {p.name}"); continue
         files.append(p)
     return files
 
-def finish_file(tgt, p, dry):
+def finish_file(source, p, dry):
+    """Called ONCE per file, after every target has ingested it."""
     if dry:
         return
-    if tgt["archive_dir"]:
-        os.makedirs(tgt["archive_dir"], exist_ok=True)
-        p.replace(Path(tgt["archive_dir"]) / p.name)
-    elif tgt["delete_after_ingest"]:
+    if source["archive_dir"]:
+        os.makedirs(source["archive_dir"], exist_ok=True)
+        p.replace(Path(source["archive_dir"]) / p.name)
+    elif source["delete_after_ingest"]:
         try: p.unlink()
         except OSError as e: print(f"    [warn] could not delete {p.name}: {e}")
-
-
-# ------------------------------------------------------------------ per-target run
-def run_target(name, tgt, store, args):
-    print(f"[target {name}] person_id={tgt['person_id']} watch_dir={tgt['watch_dir']}")
-    files = [Path(args.file)] if args.file else discover_files(tgt)
-    if not files:
-        print("    no files to process"); return 0, 0
-    tstore = store.setdefault(name, {})
-    sent = skipped = 0
-    for p in files:
-        try:
-            payload = json.loads(p.read_text())
-        except Exception as e:
-            print(f"    [skip] unparseable (retry next run): {p.name} ({e})"); continue
-        events = explode(payload, tgt)
-        batch, ok = [], True
-        for st, epoch, ev in events:
-            h = _hash({"st": st, "p": tgt["person_id"], "ev": ev, "t": int(epoch or 0)})
-            if h in tstore:
-                skipped += 1; continue
-            batch.append((h, to_hec(tgt, st, epoch, dict(ev))))
-        print(f"    {p.name}: {len(events)} events -> {len(batch)} new, {len(events)-len(batch)} dupes")
-        # send in chunks of 200
-        for i in range(0, len(batch), 200):
-            chunk = batch[i:i+200]
-            if args.dry_run:
-                continue
-            try:
-                hec_send(tgt, [e for _, e in chunk])
-            except Exception as e:
-                print(f"    [error] HEC send failed ({e}); leaving {p.name} for retry"); ok = False; break
-            for h, _ in chunk:
-                tstore[h] = 1
-            sent += len(chunk)
-        if ok and not args.dry_run:
-            finish_file(tgt, p, dry=args.keep)
-            if not args.keep:
-                print(f"    {'archived' if tgt['archive_dir'] else 'deleted'}: {p.name}")
-    return sent, skipped
 
 
 # ------------------------------------------------------------------ main
 def main():
     ap = argparse.ArgumentParser(description="Apple Health (HAE) file-drop -> HEC")
     ap.add_argument("--target", help="only this target from apple_targets.json")
-    ap.add_argument("--file", help="ingest a single specific file (ignores watch_dir discovery)")
+    ap.add_argument("--file", help="ingest a single specific file (skips folder discovery)")
     ap.add_argument("--person", help="override person_id for all targets (testing)")
     ap.add_argument("--dry-run", action="store_true", help="parse + report, no HEC send, no delete")
     ap.add_argument("--keep", action="store_true", help="do not delete/archive processed files")
@@ -445,7 +431,7 @@ def main():
     if args.reset_dedup and DEDUP_FILE.exists():
         DEDUP_FILE.unlink(); print(f"dedup store cleared ({DEDUP_FILE})")
 
-    targets = load_targets(args.target)
+    source, targets = load_config(args.target)
     if args.person:
         for t in targets.values():
             t["person_id"] = args.person
@@ -453,7 +439,7 @@ def main():
 
     store = load_json(DEDUP_FILE, {})
     if args.status:
-        print(f"targets: {', '.join(targets)}")
+        print(f"watch_dir: {source['watch_dir']}   targets: {', '.join(targets)}")
         for n in targets:
             print(f"  {n}: {len(store.get(n, {}))} deduped records")
         return
@@ -466,10 +452,46 @@ def main():
         sys.exit(f"another instance is running (lock: {LOCK_FILE}). exiting.")
     atexit.register(lambda: (fcntl.flock(lock_fp, fcntl.LOCK_UN), lock_fp.close()))
 
+    print(f"[source] watch_dir={source['watch_dir']}  targets={', '.join(targets)}")
+    files = [Path(args.file)] if args.file else discover_files(source)
+    if not files:
+        print("no files to process"); return
+
     total_sent = total_skip = 0
-    for name, tgt in targets.items():
-        s, k = run_target(name, tgt, store, args)
-        total_sent += s; total_skip += k
+    for p in files:
+        try:
+            payload = json.loads(p.read_text())
+        except Exception as e:
+            print(f"[skip] unparseable (retry next run): {p.name} ({e})"); continue
+        # Read once, fan out to EVERY target; finish (archive/delete) only if all succeed.
+        file_ok = True
+        for tname, tgt in targets.items():
+            tstore = store.setdefault(tname, {})
+            events = explode(payload, tgt)            # per-target: skip_sources/hr_firehose differ
+            batch = []
+            for st, epoch, ev in events:
+                h = _hash({"st": st, "p": tgt["person_id"], "ev": ev, "t": int(epoch or 0)})
+                if h in tstore:
+                    total_skip += 1; continue
+                batch.append((h, to_hec(tgt, st, epoch, dict(ev))))
+            sent_here = 0
+            for i in range(0, len(batch), 200):
+                chunk = batch[i:i+200]
+                if args.dry_run:
+                    continue
+                try:
+                    hec_send(tgt, [e for _, e in chunk])
+                except Exception as e:
+                    print(f"    [error] {p.name} -> {tname}: HEC send failed ({e}); "
+                          f"will retry next run"); file_ok = False; break
+                for h, _ in chunk:
+                    tstore[h] = 1
+                sent_here += len(chunk); total_sent += len(chunk)
+            print(f"    {p.name} -> {tname}: {len(events)} events, {len(batch)} new, {sent_here} sent")
+        if file_ok and not args.dry_run:
+            finish_file(source, p, dry=args.keep)
+            if not args.keep:
+                print(f"    {'archived' if source['archive_dir'] else 'deleted'}: {p.name}")
 
     # prune + persist dedup store
     for n, d in store.items():
