@@ -318,6 +318,7 @@ def explode(payload, tgt):
         ev.update({"day": day, "_vendor": vendor})
         events.append(("apple:daily", _midnight(day), ev))
 
+    events += _workout_events((payload.get("data") or {}).get("workouts") or [], tgt)
     if unmapped:
         print(f"    [info] {len(unmapped)} unmapped metric(s) skipped: {', '.join(sorted(unmapped))}")
     return events
@@ -349,6 +350,79 @@ def _sleep_events(metric, tgt):
     return out
 
 
+# Workout sources that ECHO a workout (a direct-vendor pull or a sync/aggregator app)
+# rather than the device that actually recorded it. Used to prefer the real recorder
+# when the same physical workout appears multiple times.
+_ECHO_SOURCES = {"oura", "garmin", "withings", "fitbit", "whoop", "polar",
+                 "rungap", "healthfit", "strava", "runkeeper"}
+
+def _has_device_source(hk_source):
+    """True if any pipe-token is a real recording device (not a known vendor/sync app)."""
+    toks = [t.strip().lower() for t in (hk_source or "").split("|") if t.strip()]
+    return any(t not in _ECHO_SOURCES for t in toks)
+
+def _dedup_workouts(cands):
+    """Apple Health echoes one physical workout across sources (Apple Watch, Oura,
+    RunGap, ...). Cluster same-activity workouts with overlapping time windows and keep
+    ONE — prefer a real recording device, then longest duration, then most calories."""
+    clusters = []
+    for c in sorted(cands, key=lambda x: (x["activity"], x["start"] or 0)):
+        s, e = c["start"], (c["end"] or c["start"])
+        placed = False
+        for cl in clusters:
+            if cl["activity"] == c["activity"] and s is not None and \
+               s < cl["end"] and e > cl["start"]:            # time intervals overlap
+                cl["items"].append(c)
+                cl["start"] = min(cl["start"], s); cl["end"] = max(cl["end"], e)
+                placed = True; break
+        if not placed:
+            clusters.append({"activity": c["activity"], "start": s, "end": e, "items": [c]})
+    _score = lambda c: (1 if _has_device_source(c["hk_source"]) else 0, c["dur"] or 0, c["cals"] or 0)
+    return [max(cl["items"], key=_score) for cl in clusters]
+
+def _workout_events(workouts, tgt):
+    """data.workouts[] -> apple:workout events, de-duplicated across recording sources.
+    HAE workout objects have no top-level `source` (derive vendor from nested samples);
+    `distance` is present only for distance sports (run/walk/ride)."""
+    cands = []
+    for w in workouts:
+        wsrc = ""
+        for arr in ("heartRateData", "activeEnergy", "stepCount", "basalEnergy"):
+            s = w.get(arr) or []
+            if s and isinstance(s[0], dict) and s[0].get("source"):
+                wsrc = s[0]["source"]; break
+        vendor = source_to_vendor(wsrc)
+        start_epoch, day = parse_dt(w.get("start"))
+        end_epoch, _ = parse_dt(w.get("end"))
+        def _qty(k):
+            o = w.get(k) or {}
+            return o.get("qty") if isinstance(o, dict) else None
+        ev = {"workout_activity": w.get("name"), "workout_id": w.get("id"),
+              "day": day, "hk_source": wsrc, "_vendor": vendor}
+        if start_epoch: ev["workout_start_epoch"] = int(start_epoch)
+        if end_epoch:   ev["workout_end_epoch"] = int(end_epoch)
+        dur = w.get("duration")
+        if isinstance(dur, (int, float)): ev["workout_duration_min"] = round(dur / 60.0, 1)
+        if _qty("totalEnergy") is not None:        ev["workout_calories"] = round(_qty("totalEnergy"), 1)
+        if _qty("activeEnergyBurned") is not None: ev["workout_active_calories"] = round(_qty("activeEnergyBurned"), 1)
+        if _qty("avgHeartRate") is not None:       ev["workout_avg_hr"] = round(_qty("avgHeartRate"))
+        if _qty("maxHeartRate") is not None:       ev["workout_max_hr"] = round(_qty("maxHeartRate"))
+        dist = w.get("distance") or {}
+        if isinstance(dist, dict) and dist.get("qty") is not None:
+            ev["workout_distance_m"] = round(to_meters(dist["qty"], dist.get("units")), 1)
+        cands.append({"activity": w.get("name") or "", "start": start_epoch,
+                      "end": end_epoch or start_epoch,
+                      "dur": (dur if isinstance(dur, (int, float)) else 0),
+                      "cals": (_qty("totalEnergy") or 0), "vendor": vendor,
+                      "hk_source": wsrc, "epoch": start_epoch or _midnight(day), "ev": ev})
+    out = []
+    for c in _dedup_workouts(cands):          # dedup FIRST, then apply skip_sources to survivors
+        if c["vendor"] in tgt["skip_sources"]:
+            continue
+        out.append(("apple:workout", c["epoch"], c["ev"]))
+    return out
+
+
 def _midnight(day):
     try:
         return time.mktime(datetime.datetime.strptime(day, "%Y-%m-%d").timetuple())
@@ -369,7 +443,9 @@ def hec_send(tgt, batch):
     r = requests.post(tgt["hec_url"], data=body,
                       headers={"Authorization": f"Splunk {tgt['hec_token']}"},
                       verify=verify, timeout=120)
-    r.raise_for_status()
+    if r.status_code >= 300:
+        # surface HEC's reason (e.g. Incorrect index / invalid token) instead of a bare 400
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text.strip()[:300]}")
 
 
 # ------------------------------------------------------------------ file discovery
