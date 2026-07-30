@@ -172,7 +172,7 @@ def _hash(obj):
 # ------------------------------------------------------------------ mapping helpers
 VENDOR_KEYWORDS = [("oura", "oura"), ("garmin", "garmin"), ("withings", "withings"),
                    ("fitbit", "fitbit"), ("whoop", "whoop"), ("polar", "polar"),
-                   ("wahoo", "wahoo"), ("peloton", "peloton")]
+                   ("wahoo", "wahoo"), ("peloton", "peloton"), ("hume", "hume")]
 
 def source_to_vendor(hk_source):
     """Map an Apple HealthKit source string to a canonical vendor. A pipe-delimited
