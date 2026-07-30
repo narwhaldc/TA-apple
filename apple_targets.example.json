@@ -31,6 +31,17 @@
       "verify_ssl": true,
       "skip_sources": [],
       "hr_firehose": false
+    },
+
+    "cloudWearables": {
+      "hec_url": "https://http-inputs-YOUR-STACK.splunkcloud.com:443/services/collector/event",
+      "hec_token": "PUT-CLOUD-WEARABLES-HEC-TOKEN-HERE",
+      "index": "wearables",
+      "person_id": "P001",
+      "verify_ssl": true,
+      "skip_sources": ["Oura", "Withings"],
+      "_skip_note": "Cloud also runs TA-oura/TA-garmin/TA-withings, so skip the vendors you push to Cloud directly (Apple relays Oura + Withings into HealthKit) to avoid double-counting. Use [] only if Cloud gets NO direct vendor data. Verify on Admin > Ingest & Data Quality > cross-pipeline double-representation. Cloud HEC = dedicated http-inputs host on :443, real cert (verify_ssl true), token scoped to index=wearables.",
+      "hr_firehose": false
     }
   }
 }
