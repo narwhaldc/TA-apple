@@ -28,7 +28,9 @@ double-counting. Apple = breadth; direct TAs = depth.
 - `tools/apple_to_hec.py` — the pull-and-forward script (**repo-only, never shipped**)
 - `apple_targets.example.json` — copy to `tools/apple_targets.json` (gitignored)
 
-Setup + security + Linux notes: see **[INSTALL.md](INSTALL.md)**.
+Setup + security + Linux notes: see **[INSTALL.md](INSTALL.md)**. Optional: mirror ingest logs to
+Splunk (a `logging` block in `apple_targets.json` → the wearables **Ingest Health** dashboard),
+see INSTALL.md §3b.
 
 Runs on **Linux or macOS** (pure Python: `json` + `requests`). Only secret needed is the HEC
 token; PHI never enters the repo (`.gitignore` blocks all data files under `tools/`).

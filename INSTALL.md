@@ -26,7 +26,9 @@ model. The **puller** in `tools/` is repo-only (never shipped in the `.spl`).
 ---
 
 ## 1. iOS — Health Auto Export automation
-Install **Health Auto Export – JSON+CSV**. Create an **Automation**:
+Install **Health Auto Export – JSON+CSV**. **Note:** the app is free to *manually* export, but
+**scheduled/automatic export (Automations) requires the paid subscription** — you need that tier for
+the hands-off cron pipeline below. Create an **Automation**:
 - **Data Type = Health Metrics** (start here — steps/HR/sleep/energy/SpO2/body-comp). Add a
   second automation for **Workouts** later if you want activity/GPS. Skip the sensitive types
   (Symptoms/ECG/State of Mind/Menstrual/Medications) unless you deliberately want them.
@@ -63,6 +65,27 @@ and **`watch_dir`** (the synced folder from step 2). Options: `skip_sources` (de
 ingest everything, "Apple-hub" mode), `hr_firehose` (default off), `delete_after_ingest` /
 `archive_dir`, `min_file_age_seconds`. (Alternatively set `SPLUNK_HEC_URL`/`SPLUNK_HEC_TOKEN` +
 `APPLE_WATCH_DIR`/`APPLE_PERSON_ID` in a gitignored `.env`.)
+
+## 3b. Optional: mirror ingest logs to Splunk (Ingest Health dashboard)
+The puller always writes **logfmt** logs to **stderr** (`<ts> level=… comp=apple msg="…" …`) — add a
+`>> apple_to_hec.log 2>&1` redirect in your cron wrapper (`hae_sync.sh`, step 4) to capture them. To
+also **mirror those logs into Splunk** so the wearables **Ingest Health** dashboard can show real
+success/failure/duration (not just "had new data"), add a top-level `logging` block to
+`apple_targets.json`:
+```json
+"logging": { "method": "hec", "hec_logging_index": "wearables_log" }
+```
+- With `method: "hec"`, logs go to **each target's own HEC** (reusing that target's `hec_url` +
+  `hec_token`) into `hec_logging_index`. Fan out to several Splunks → **each gets its own ingest
+  logs** (run-level lines everywhere; per-target lines only to that target's Splunk).
+- **Create a second index for the logs** — `wearables_log` — separate from the `wearables` data
+  index. Splunk retention is **per-index**, so a separate index lets you keep logs ~30 days while
+  health data stays for years.
+- **The same HEC token must have write access to BOTH indexes** — the data index (`wearables`) and
+  `hec_logging_index` (`wearables_log`). One token, two indexes.
+- stderr stays on regardless; **remove the block to log to stderr only.** Logs arrive as sourcetype
+  `wearables:ingest`. Endpoint overridable per target with `hec_logging_url` / `hec_logging_token`.
+- **Per-person RBAC on the log index:** `person_id` is stamped as an **indexed field** on each per-target log line (`sent events` / `send failed`), and on run-level lines (`run started` / `run complete`) **only when the run is a single person**. So a person-scoped `srchFilter` on `wearables_log` shows a self-manager their own ingest health (including run start/stop/duration), while multi-person aggregator runs keep run-level lines admin-only (the aggregate `events=N` total is not leaked to individuals). To scope logs by person, add `wearables_log` to the wearables role's `srchFilter` (same person_id key as the data index).
 
 ## 4. Run + schedule
 ```
