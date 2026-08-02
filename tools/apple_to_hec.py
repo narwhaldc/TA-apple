@@ -41,6 +41,27 @@ except ImportError:
 HERE = Path(__file__).resolve().parent
 
 
+# ---- Splunk-friendly logging (logfmt: <ts> level=.. comp=apple msg=".." key=val) ----
+_LOG_COMPONENT = "apple"
+
+
+def _logfmt(v):
+    s = str(v)
+    return '"' + s.replace('"', "'") + '"' if (s == "" or " " in s or "=" in s) else s
+
+
+def _log(level, msg, **kv):
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    extra = "".join(" %s=%s" % (k, _logfmt(v)) for k, v in kv.items())
+    print("%s level=%s comp=%s msg=%s%s" % (ts, level, _LOG_COMPONENT, _logfmt(msg), extra),
+          file=sys.stderr)
+
+
+def log_info(msg, **kv):  _log("INFO", msg, **kv)
+def log_warn(msg, **kv):  _log("WARN", msg, **kv)
+def log_error(msg, **kv): _log("ERROR", msg, **kv)
+
+
 # ------------------------------------------------------------------ .env autoload
 def load_dotenv():
     """Populate os.environ from a local .env (KEY=VALUE) next to this script.
@@ -92,17 +113,16 @@ def load_config(target_filter=None):
             if name.startswith("_"):
                 continue
             if not cfg.get("hec_url") or not cfg.get("hec_token"):
-                print(f"[warn] target '{name}' missing hec_url/hec_token — skipping"); continue
+                log_warn("target missing hec_url/hec_token; skipping", target=name); continue
             if not cfg.get("person_id"):
-                print(f"[warn] target '{name}' has no person_id — required for wearables RBAC")
+                log_warn("target missing person_id (required for RBAC)", target=name)
             targets[name] = _norm_target(cfg)
         src_raw = raw.get("source")
         if src_raw is None:
             for name, cfg in raw_targets.items():
                 if cfg.get("watch_dir"):
-                    print(f"[note] no top-level 'source' block — using watch_dir/archive_dir "
-                          f"from target '{name}'. Move these to a shared top-level 'source' "
-                          f"block (see apple_targets.example.json) so every target gets the data.")
+                    log_warn("no top-level 'source' block; using target watch_dir (move to a "
+                             "shared 'source' block so every target gets the data)", target=name)
                     src_raw = cfg; break
         source = _norm_source(src_raw or {})
     else:
@@ -157,7 +177,7 @@ def _norm_source(cfg):
 def load_json(path, default):
     if path.exists():
         try: return json.loads(path.read_text())
-        except Exception as e: print(f"[warn] could not read {path} ({e}); fresh")
+        except Exception as e: log_warn("could not read state file; starting fresh", path=str(path), error=type(e).__name__)
     return default
 
 def save_json(path, obj):
@@ -345,7 +365,8 @@ def explode(payload, tgt):
 
     events += _workout_events((payload.get("data") or {}).get("workouts") or [], tgt)
     if unmapped:
-        print(f"    [info] {len(unmapped)} unmapped metric(s) -> apple:extra: {', '.join(sorted(unmapped))}")
+        log_info("unmapped metrics routed to apple:extra", count=len(unmapped),
+                 metrics=",".join(sorted(unmapped)))
     return events
 
 
@@ -495,13 +516,13 @@ def discover_files(source):
     for path in sorted(glob.glob(os.path.join(wd, source["file_glob"]))):
         p = Path(path)
         if is_icloud_placeholder(p):
-            print(f"    [skip] iCloud placeholder not yet downloaded: {p.name}"); continue
+            log_warn("skipping iCloud placeholder not yet downloaded", file=p.name); continue
         try:
             age = now - p.stat().st_mtime
         except OSError:
             continue
         if age < source["min_file_age_seconds"]:
-            print(f"    [skip] too new ({int(age)}s, still syncing?): {p.name}"); continue
+            log_warn("skipping file still syncing", file=p.name, age_s=int(age)); continue
         files.append(p)
     return files
 
@@ -514,7 +535,7 @@ def finish_file(source, p, dry):
         p.replace(Path(source["archive_dir"]) / p.name)
     elif source["delete_after_ingest"]:
         try: p.unlink()
-        except OSError as e: print(f"    [warn] could not delete {p.name}: {e}")
+        except OSError as e: log_warn("could not delete processed file", file=p.name, error=type(e).__name__)
 
 
 # ------------------------------------------------------------------ main
@@ -550,7 +571,8 @@ def main():
     try:
         fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        sys.exit(f"another instance is running (lock: {LOCK_FILE}). exiting.")
+        log_warn("another run holds the lock; exiting", lock_file=str(LOCK_FILE))
+        sys.exit(1)
     def _release_lock():
         # Unlock + close + remove the lock FILE on clean exit. Registered only after
         # we hold the flock, so a losing instance can't delete another's lock. On a
@@ -564,46 +586,59 @@ def main():
         except OSError: pass
     atexit.register(_release_lock)
 
-    print(f"[source] watch_dir={source['watch_dir']}  targets={', '.join(targets)}")
     files = [Path(args.file)] if args.file else discover_files(source)
+    t0 = time.time()
+    log_info("run started", watch_dir=source["watch_dir"], targets=len(targets),
+             files=len(files), dry_run=args.dry_run)
     if not files:
-        print("no files to process"); return
+        log_info("run complete", events=0, skipped=0, files=0, failures=0, targets=len(targets),
+                 duration_s=round(time.time() - t0, 1), dry_run=args.dry_run)
+        return
 
-    total_sent = total_skip = 0
-    for p in files:
-        try:
-            payload = json.loads(p.read_text())
-        except Exception as e:
-            print(f"[skip] unparseable (retry next run): {p.name} ({e})"); continue
-        # Read once, fan out to EVERY target; finish (archive/delete) only if all succeed.
-        file_ok = True
-        for tname, tgt in targets.items():
-            tstore = store.setdefault(tname, {})
-            events = explode(payload, tgt)            # per-target: skip_sources/hr_firehose differ
-            batch = []
-            for st, epoch, ev in events:
-                h = _hash({"st": st, "p": tgt["person_id"], "ev": ev, "t": int(epoch or 0)})
-                if h in tstore:
-                    total_skip += 1; continue
-                batch.append((h, to_hec(tgt, st, epoch, dict(ev))))
-            sent_here = 0
-            for i in range(0, len(batch), 200):
-                chunk = batch[i:i+200]
-                if args.dry_run:
-                    continue
-                try:
-                    hec_send(tgt, [e for _, e in chunk])
-                except Exception as e:
-                    print(f"    [error] {p.name} -> {tname}: HEC send failed ({e}); "
-                          f"will retry next run"); file_ok = False; break
-                for h, _ in chunk:
-                    tstore[h] = 1
-                sent_here += len(chunk); total_sent += len(chunk)
-            print(f"    {p.name} -> {tname}: {len(events)} events, {len(batch)} new, {sent_here} sent")
-        if file_ok and not args.dry_run:
-            finish_file(source, p, dry=args.keep)
-            if not args.keep:
-                print(f"    {'archived' if source['archive_dir'] else 'deleted'}: {p.name}")
+    total_sent = total_skip = failed = 0
+    try:
+        for p in files:
+            try:
+                payload = json.loads(p.read_text())
+            except Exception as e:
+                failed += 1
+                log_error("unparseable file; will retry next run", file=p.name, error=type(e).__name__); continue
+            # Read once, fan out to EVERY target; finish (archive/delete) only if all succeed.
+            file_ok = True
+            for tname, tgt in targets.items():
+                tstore = store.setdefault(tname, {})
+                events = explode(payload, tgt)            # per-target: skip_sources/hr_firehose differ
+                batch = []
+                for st, epoch, ev in events:
+                    h = _hash({"st": st, "p": tgt["person_id"], "ev": ev, "t": int(epoch or 0)})
+                    if h in tstore:
+                        total_skip += 1; continue
+                    batch.append((h, to_hec(tgt, st, epoch, dict(ev))))
+                sent_here = 0
+                for i in range(0, len(batch), 200):
+                    chunk = batch[i:i+200]
+                    if args.dry_run:
+                        continue
+                    try:
+                        hec_send(tgt, [e for _, e in chunk])
+                    except Exception as e:
+                        failed += 1
+                        log_error("HEC send failed; will retry next run", file=p.name, target=tname,
+                                  error=type(e).__name__, detail=str(e)); file_ok = False; break
+                    for h, _ in chunk:
+                        tstore[h] = 1
+                    sent_here += len(chunk); total_sent += len(chunk)
+                log_info("sent events", person_id=tgt.get("person_id"), target=tname, file=p.name,
+                         events=len(events), new=len(batch), count=sent_here)
+            if file_ok and not args.dry_run:
+                finish_file(source, p, dry=args.keep)
+                if not args.keep:
+                    log_info("finished file", file=p.name,
+                             action=("archived" if source["archive_dir"] else "deleted"))
+    except Exception as e:
+        log_error("run failed", error=type(e).__name__, detail=str(e),
+                  duration_s=round(time.time() - t0, 1))
+        sys.exit(1)
 
     # prune + persist dedup store
     for n, d in store.items():
@@ -611,8 +646,9 @@ def main():
             store[n] = dict(list(d.items())[-DEDUP_MAX:])
     if not args.dry_run:
         save_json(DEDUP_FILE, store)
-    print(f"done: {total_sent} events sent, {total_skip} deduped"
-          f"{' (dry-run)' if args.dry_run else ''}")
+    log_info("run complete", events=total_sent, skipped=total_skip, files=len(files),
+             failures=failed, targets=len(targets), duration_s=round(time.time() - t0, 1),
+             dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
