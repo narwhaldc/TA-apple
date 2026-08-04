@@ -1,6 +1,6 @@
 # TA-apple → Splunk — Installation Guide
 
-**App version:** TA-apple 0.1.1 · Apache-2.0 · Source: https://github.com/narwhaldc
+**App version:** TA-apple 0.1.2 · Apache-2.0 · Source: https://github.com/narwhaldc
 
 Ingest **Apple Health / HealthKit** into the canonical **Wearables** data model. HealthKit is
 on-device only (no cloud API), so the iOS app **Health Auto Export (HAE)** writes JSON export
@@ -150,7 +150,17 @@ inspect). Use `rclone move` to keep the cloud folder tidy (or `copy` to retain t
 
 **Linux + rclone remote (headless):** install rclone, then `rclone config` a `drive`/`dropbox`
 remote — answer **`n`** to "Use auto config?" and run the printed `rclone authorize` on a machine
-with a browser, pasting the token back. Verify with `rclone lsf <remote>:<folder>`.
+with a browser, pasting the token back. Verify with `rclone lsf <remote>:<folder>`. (Full
+Google-Drive walkthrough is in section 2.)
+
+**Prune the archive.** If you set `source.archive_dir`, it's a *safety window* the puller never
+cleans — add a small dedicated cron to age files out. Default ~365 days:
+```
+0 4 * * * find /home/tony/hae_archive_alex -type f -name "*.json" -mtime +365 -delete
+```
+`-type f` (files only), `-name "*.json"` (touch nothing else), `-mtime +365` (older than a year).
+One line per person's archive, or point `find` at a shared parent that holds all of them. Leave
+`archive_dir: null` if you'd rather the puller just delete after a successful ingest (no archive to prune).
 
 ## 5. Install the Splunk app
 Install the `TA-apple` `.spl` (Apps → Install app from file) on the search head/indexer that
