@@ -44,6 +44,10 @@ the hands-off cron pipeline below. Create an **Automation**:
 ## 2. Sync the folder to the host that runs the puller
 The puller reads a **plain directory** — it never talks to iCloud/Dropbox itself, so pick
 whatever keeps a folder current on your host:
+- **Linux + Google Drive (`rclone`) — recommended for a headless Linux host** — HAE exports into a
+  Google Drive folder; `rclone` mirrors that folder to a local watch dir (e.g. `~/hae_inbox`) that
+  the puller reads. No browser needed on the box (headless auth). **Step-by-step rclone setup is in
+  the "rclone quick-start" box right below the list.**
 - **macOS + iCloud Drive** — HAE → an iCloud folder; on the Mac it appears under
   `~/Library/Mobile Documents/…`. **Finder → right-click the folder → "Keep Downloaded"** so
   iCloud doesn't evict files to placeholders. (The puller also best-effort triggers a download
@@ -53,6 +57,43 @@ whatever keeps a folder current on your host:
 - **Linux + iCloud** — optional: use `rclone`/`pyicloud` (Apple ID **app-specific password**,
   not your real password) to drop files into the folder. Extra dependency; keep the app-password
   in `.env`/targets (gitignored, `chmod 0600`).
+
+### rclone quick-start (Google Drive) — the recommended headless path
+New to `rclone`? It's a CLI that mirrors a cloud folder to a local one. One-time setup on the host:
+
+1. **Install rclone**
+   - Linux: `curl https://rclone.org/install.sh | sudo bash`  (or `sudo apt install rclone` / `sudo dnf install rclone`)
+   - macOS: `brew install rclone`
+   - Confirm: `rclone version`
+2. **Create the Google Drive remote** — run `rclone config` and answer the prompts:
+   - `n` — New remote → **name** it `gdrive` (any name; it must match your move command / cron)
+   - **Storage**: type `drive` (Google Drive)
+   - `client_id` / `client_secret`: press **Enter** on both to use rclone's built-in keys (fine to start)
+   - **scope**: `1` (Full access), or `2` (read-only) if the box only ever pulls
+   - Edit advanced config: `n`
+   - **Use auto config? → `n`** (say **no** on a headless box). rclone prints an
+     `rclone authorize "drive" …` command — run **that command on any machine with a browser**
+     (your Mac/laptop), approve Google in the browser, and **paste the returned token back** at the prompt.
+   - Configure as a Shared Drive? `n` (unless the folder lives on a Team/Shared Drive) → `y` to confirm → `q` to quit
+3. **Verify it can see the HAE export folder** (the Google Drive folder HAE writes into):
+   ```
+   rclone lsf gdrive:"Health Auto Export/HAE_to_splunk"
+   ```
+   It should list the `*.json` files HAE is dropping. (Adjust the path to your actual HAE destination folder.)
+4. **Mirror to the local watch dir** the puller reads, then point `source.watch_dir` (step 3) at it:
+   ```
+   mkdir -p ~/hae_inbox
+   rclone move gdrive:"Health Auto Export/HAE_to_splunk" ~/hae_inbox --include "*.json" --drive-use-trash=false
+   ```
+   `move` empties the cloud folder as it copies (keeps Drive tidy); use `copy` to retain the originals.
+   Schedule this `rclone move` **immediately before** the puller in one cron line (see step 4, "Run + schedule").
+
+**Onboarding a second person on the same box:** give them their **own** Google Drive folder + rclone
+remote (or subfolder), their **own** local inbox (e.g. `~/hae_inbox_alex`), and a **second targets file**
+(`cp apple_targets.json apple_targets_alex.json`; set `source.watch_dir` to their inbox and the target's
+`person_id` to theirs — same `hec_url`/`hec_token`/`index`). Run their puller with
+`APPLE_TARGETS_FILE=~/src/TA-apple/tools/apple_targets_alex.json python3 apple_to_hec.py`. Register their
+`person_id` in the wearables app first (Admin → People).
 
 ## 3. Configure the puller
 ```
