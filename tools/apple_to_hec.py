@@ -49,6 +49,9 @@ HERE = Path(__file__).resolve().parent
 # the ERROR), and if the flush itself fails (e.g. HEC is the thing that's down) the
 # lines are dumped to stderr and NEVER re-sent over HEC. Dry-run never flushes.
 _LOG_COMPONENT = "apple"
+# Fetcher version — BUMP on every fetcher change (repo-only, not in the .spl);
+# emitted as fetcher_ver= on the post-sink "run started" line for drift tracking.
+FETCHER_VERSION = "1.0.0"
 
 _LOG_SINKS = []               # [{"url","token","index","verify","targets":set(),"buf":[]}]
 _LOG_STATE = {"on": False, "dry": False, "target_pids": {}, "solo_pid": None}
@@ -686,7 +689,7 @@ def main():
     configure_hec_log(load_logging_cfg(), targets, args.dry_run)
     files = [Path(args.file)] if args.file else discover_files(source)
     t0 = time.time()
-    log_info("run started", watch_dir=source["watch_dir"], targets=len(targets),
+    log_info("run started", fetcher_ver=FETCHER_VERSION, watch_dir=source["watch_dir"], targets=len(targets),
              files=len(files), dry_run=args.dry_run)
     if not files:
         log_info("run complete", events=0, skipped=0, files=0, failures=0, targets=len(targets),
