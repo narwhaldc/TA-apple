@@ -51,7 +51,7 @@ HERE = Path(__file__).resolve().parent
 _LOG_COMPONENT = "apple"
 # Fetcher version — BUMP on every fetcher change (repo-only, not in the .spl);
 # emitted as fetcher_ver= on the post-sink "run started" line for drift tracking.
-FETCHER_VERSION = "1.0.0"
+FETCHER_VERSION = "1.1.0"
 # Box running this fetcher (its OWN hostname — not Splunk's HEC `host`). Sent as
 # run_host= on run-started so Ingest Health shows which box/person to nudge to upgrade.
 import socket
@@ -298,9 +298,25 @@ VENDOR_KEYWORDS = [("oura", "oura"), ("garmin", "garmin"), ("withings", "withing
                    ("fitbit", "fitbit"), ("whoop", "whoop"), ("polar", "polar"),
                    ("wahoo", "wahoo"), ("peloton", "peloton"), ("hume", "hume")]
 
+# Genuine Apple-native sources (Apple Watch / iPhone / built-in apps) legitimately map to
+# vendor=apple. Anything NOT a known third-party (VENDOR_KEYWORDS) and NOT apple-native is
+# an UNKNOWN relayed source — a device that pushes into Apple Health without its own API/TA
+# (RingConn, etc.). We stamp a PROVISIONAL per-source vendor (the honest ORIGIN — "apple"
+# is only the transport, = sourcetype apple:*) and WARN once per run so it can be promoted
+# into VENDOR_KEYWORDS. See aggregator-open-vendor-set.
+APPLE_NATIVE_KW = ["apple watch", "iphone", "ipad", "apple"]
+APPLE_NATIVE_EXACT = {"health", "clock", "fitness", "siri", "workout", ""}
+_UNKNOWN_SOURCES = collections.Counter()   # raw source label -> points seen this run
+
+def _provisional_vendor(raw):
+    """First alphanumeric token of the raw source, lowercased ('RingConn Health' -> 'ringconn')."""
+    toks = "".join(c if c.isalnum() else " " for c in (raw or "").lower()).split()
+    return toks[0] if toks else "unknown"
+
 def source_to_vendor(hk_source):
-    """Map an Apple HealthKit source string to a canonical vendor. A pipe-delimited
-    multi-source (e.g. 'Narwhal Ultra 2|Oura') is Apple's merged view -> apple."""
+    """Map an Apple HealthKit source string to a canonical ORIGIN vendor. A pipe-delimited
+    multi-source (e.g. 'Narwhal Ultra 2|Oura') is Apple's merged view -> apple. Unknown
+    third-party sources get a provisional per-source vendor + a run-level WARN (not 'apple')."""
     raw = hk_source or ""
     if "|" in raw:
         return "apple"
@@ -308,7 +324,13 @@ def source_to_vendor(hk_source):
     for kw, v in VENDOR_KEYWORDS:
         if kw in s:
             return v
-    return "apple"
+    for kw in APPLE_NATIVE_KW:
+        if kw in s:
+            return "apple"
+    if s.strip() in APPLE_NATIVE_EXACT:
+        return "apple"
+    _UNKNOWN_SOURCES[raw] += 1
+    return _provisional_vendor(raw)
 
 def to_kg(qty, units):
     u = (units or "").lower()
@@ -751,6 +773,10 @@ def main():
             store[n] = dict(list(d.items())[-DEDUP_MAX:])
     if not args.dry_run:
         save_json(DEDUP_FILE, store)
+    # Discovery: one WARN per unknown relayed source this run (promote into VENDOR_KEYWORDS).
+    for src, n in sorted(_UNKNOWN_SOURCES.items(), key=lambda kv: -kv[1]):
+        log_warn("unknown relayed source", raw_source=src, vendor=_provisional_vendor(src),
+                 via="apple", points=n)
     log_info("run complete", events=total_sent, skipped=total_skip, files=len(files),
              failures=failed, targets=len(targets), duration_s=round(time.time() - t0, 1),
              dry_run=args.dry_run)
