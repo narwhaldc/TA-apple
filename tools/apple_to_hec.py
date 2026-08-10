@@ -51,7 +51,7 @@ HERE = Path(__file__).resolve().parent
 _LOG_COMPONENT = "apple"
 # Fetcher version — BUMP on every fetcher change (repo-only, not in the .spl);
 # emitted as fetcher_ver= on the post-sink "run started" line for drift tracking.
-FETCHER_VERSION = "1.1.0"
+FETCHER_VERSION = "1.1.1"
 # Box running this fetcher (its OWN hostname — not Splunk's HEC `host`). Sent as
 # run_host= on run-started so Ingest Health shows which box/person to nudge to upgrade.
 import socket
@@ -304,7 +304,10 @@ VENDOR_KEYWORDS = [("oura", "oura"), ("garmin", "garmin"), ("withings", "withing
 # (RingConn, etc.). We stamp a PROVISIONAL per-source vendor (the honest ORIGIN — "apple"
 # is only the transport, = sourcetype apple:*) and WARN once per run so it can be promoted
 # into VENDOR_KEYWORDS. See aggregator-open-vendor-set.
-APPLE_NATIVE_KW = ["apple watch", "iphone", "ipad", "apple"]
+# "narwhal" = this deployment's renamed Apple devices (e.g. "Narwhal Ultra 2" = Apple
+# Watch Ultra 2, "Narwhal16Pro" = iPhone 16 Pro) — a renamed native device the display
+# name can't otherwise reveal. Promoted here after the discovery panel surfaced them.
+APPLE_NATIVE_KW = ["apple watch", "iphone", "ipad", "apple", "narwhal"]
 APPLE_NATIVE_EXACT = {"health", "clock", "fitness", "siri", "workout", ""}
 _UNKNOWN_SOURCES = collections.Counter()   # raw source label -> points seen this run
 
