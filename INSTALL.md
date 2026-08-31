@@ -1,6 +1,6 @@
 # TA-apple → Splunk — Installation Guide
 
-**App version:** TA-apple 0.1.3 · Apache-2.0 · Source: https://github.com/narwhaldc
+**App version:** TA-apple 0.1.4 · Apache-2.0 · Source: https://github.com/narwhaldc
 
 Ingest **Apple Health / HealthKit** into the canonical **Wearables** data model. HealthKit is
 on-device only (no cloud API), so the iOS app **Health Auto Export (HAE)** writes JSON export
@@ -104,7 +104,8 @@ Edit it: **`hec_url`** must be the **event** endpoint `https://<host>:8088/servi
 (the puller sends proper event-wrapped JSON — not `/raw`), **`hec_token`**, **`person_id`**,
 and **`watch_dir`** (the synced folder from step 2). Options: `skip_sources` (default empty =
 ingest everything, "Apple-hub" mode), `hr_firehose` (default off), `delete_after_ingest` /
-`archive_dir`, `min_file_age_seconds`. (Alternatively set `SPLUNK_HEC_URL`/`SPLUNK_HEC_TOKEN` +
+`archive_dir`, `min_file_age_seconds`, `file_glob` (default `*.json` — narrow it only if the
+watch dir also receives files you don't want ingested). (Alternatively set `SPLUNK_HEC_URL`/`SPLUNK_HEC_TOKEN` +
 `APPLE_WATCH_DIR`/`APPLE_PERSON_ID` in a gitignored `.env`.)
 
 ## 3b. Optional: mirror ingest logs to Splunk (Ingest Health dashboard)
