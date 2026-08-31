@@ -18,10 +18,17 @@ tools/apple_samples/
 *.HealthAutoExport*.json
 HealthAutoExport*.json
 
-# BELT-AND-SUSPENDERS: no data files anywhere under tools/ (the ONLY tracked file
-# there is apple_to_hec.py). Blocks any stray HAE export / sample / runtime-state
-# file from leaking PHI or tokens into the repo via the tools/ vector.
+# BELT-AND-SUSPENDERS: no data files anywhere under tools/ (the only tracked files
+# there are apple_to_hec.py and the placeholder-only targets EXAMPLE below). Blocks
+# any stray HAE export / sample / runtime-state file from leaking PHI or tokens into
+# the repo via the tools/ vector.
 tools/*.json
+# EXCEPTION (deliberate): the targets TEMPLATE must be tracked so users can fetch it
+# from GitHub — INSTALL.md step 3 and apple_to_hec.py's own error messages both tell
+# you to copy it. It contains ONLY placeholders (YOUR-HEC-TOKEN / P001 / ~/hae_inbox),
+# never real values; the filled-in apple_targets.json stays ignored by the rules above.
+# Matches how TA-oura / TA-withings / TA-google track their own *_targets.example.json.
+!tools/apple_targets.example.json
 tools/*.csv
 tools/*.ndjson
 tools/*.jsonl

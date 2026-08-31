@@ -1,6 +1,6 @@
 # TA-apple → Splunk — Installation Guide
 
-**App version:** TA-apple 0.1.2 · Apache-2.0 · Source: https://github.com/narwhaldc
+**App version:** TA-apple 0.1.3 · Apache-2.0 · Source: https://github.com/narwhaldc
 
 Ingest **Apple Health / HealthKit** into the canonical **Wearables** data model. HealthKit is
 on-device only (no cloud API), so the iOS app **Health Auto Export (HAE)** writes JSON export
@@ -97,7 +97,7 @@ remote (or subfolder), their **own** local inbox (e.g. `~/hae_inbox_alex`), and 
 
 ## 3. Configure the puller
 ```
-cp apple_targets.example.json tools/apple_targets.json    # gitignored
+cp tools/apple_targets.example.json tools/apple_targets.json    # gitignored
 chmod 600 tools/apple_targets.json
 ```
 Edit it: **`hec_url`** must be the **event** endpoint `https://<host>:8088/services/collector/event`

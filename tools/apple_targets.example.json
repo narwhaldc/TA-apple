@@ -1,0 +1,27 @@
+{
+  "logging": {
+    "_comment": "OPTIONAL. Mirror the fetcher's stderr logs into Splunk via HEC so the Ingest Health dashboard can show real ingest success/failure/duration. stderr is ALWAYS on regardless of this block. With method=hec the logs go to EACH target's own HEC (reusing its hec_url + hec_token) into hec_logging_index - so every Splunk you feed sees its OWN ingest health. Override the endpoint with hec_logging_url / hec_logging_token if you must. NOTE: each target's HEC token must have write access to BOTH its data index AND hec_logging_index (one token, two indexes). Provision hec_logging_index (e.g. wearables_log) once per Splunk so logs can carry a shorter retention than health data. Remove this block to log to stderr only.",
+    "method": "hec",
+    "hec_logging_index": "wearables_log"
+  },
+  "source": {
+    "_comment": "UNLIKE the API-pull TAs, TA-apple WATCHES A FOLDER: Health Auto Export drops JSON there (usually synced down from Google Drive / iCloud by rclone - see INSTALL.md step 2). ONE shared source block feeds ALL targets below: each file is read once, fanned out to every target, and cleaned up ONCE (only after all targets succeed). min_file_age_seconds avoids reading a file still being written/synced. Set archive_dir to keep originals instead of deleting (delete_after_ingest then only removes the copy from watch_dir).",
+    "watch_dir": "~/hae_inbox",
+    "file_glob": "*.json",
+    "min_file_age_seconds": 60,
+    "delete_after_ingest": true,
+    "archive_dir": null
+  },
+  "targets": {
+    "personal": {
+      "_comment": "skip_sources drops data whose mapped vendor you ALSO pull via its own direct TA, to avoid double-representing the same measurement through two pipelines. START with [] (ingest EVERYTHING - 'Apple hub' mode) so your first run definitely produces data; once it is flowing, add the vendors you pull directly (e.g. [\"oura\",\"withings\"]). hr_firehose (default false) admits Apple's per-sample heart_rate stream - high volume, only enable if you want intraday HR from Apple rather than a direct TA. person_id is REQUIRED for RBAC - register it in the wearables app first (Admin > People).",
+      "hec_url":      "https://splunk:8088/services/collector/event",
+      "hec_token":    "YOUR-HEC-TOKEN",
+      "index":        "wearables",
+      "person_id":    "P001",
+      "verify_ssl":   false,
+      "skip_sources": [],
+      "hr_firehose":  false
+    }
+  }
+}
