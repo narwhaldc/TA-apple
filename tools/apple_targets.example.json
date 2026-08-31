@@ -16,13 +16,14 @@
     "personal": {
       "_comment": "skip_sources drops data whose mapped vendor you ALSO pull via its own direct TA, to avoid double-representing the same measurement through two pipelines. START with [] (ingest EVERYTHING - 'Apple hub' mode) so your first run definitely produces data; once it is flowing, add the vendors you pull directly (e.g. [\"oura\",\"withings\"]). hr_firehose (default false) admits Apple's per-sample heart_rate stream - high volume, only enable if you want intraday HR from Apple rather than a direct TA. person_id is REQUIRED for RBAC - register it in the wearables app first (Admin > People).",
       "_comment_optional_includes": "PRIVACY GATE, default DENY. Valid values: womanHealth (menstrual/reproductive/fertility/menopause), medicines (medication logging), mentalHealth (State of Mind / mood), symptoms. Anything matching those categories is DROPPED before it ever reaches Splunk unless listed here - leave [] and none of it is ingested. Deleting this key entirely has the SAME effect as [] (fail-closed), so old targets files are safe without editing. Each run logs one WARN naming exactly what it dropped, so a block is never silent. This is the SECOND layer of defense: the first is simply not enabling those data types in the Health Auto Export app (see INSTALL.md step 1), and Apple additionally requires per-medication access grants under Health > Data Sources & Access.",
-      "hec_url":      "https://splunk:8088/services/collector/event",
-      "hec_token":    "YOUR-HEC-TOKEN",
-      "index":        "wearables",
-      "person_id":    "P001",
-      "verify_ssl":   false,
+      "_comment_hec_url": "Splunk Cloud uses a DIFFERENT hostname than your search head, and the form depends on which cloud provider hosts your stack - a one-character difference that FAILS SILENTLY. AWS:  https://http-inputs-<host>.splunkcloud.com:443/services/collector/event  (HYPHEN after http-inputs). GCP:  https://http-inputs.<host>.splunkcloud.com:443/services/collector/event  (DOT after http-inputs). On-prem/self-managed is just your indexer or LB on port 8088, as shown below. Always the /event endpoint, never /raw. Get the exact URL from Splunk Web > Settings > Data Inputs > HTTP Event Collector.",
+      "hec_url": "https://splunk:8088/services/collector/event",
+      "hec_token": "YOUR-HEC-TOKEN",
+      "index": "wearables",
+      "person_id": "P001",
+      "verify_ssl": false,
       "skip_sources": [],
-      "hr_firehose":  false,
+      "hr_firehose": false,
       "optional_includes": []
     }
   }
