@@ -17,6 +17,12 @@ Design notes (see INSTALL.md):
     `hk_source` (`source` is a RESERVED Splunk field) and derive canonical
     `vendor` from it. `skip_sources` (default empty) lets you drop a vendor you
     also pull with its own TA, to avoid double-counting.
+  * PRIVACY-SENSITIVE categories (menstrual/reproductive, medications, mood,
+    symptoms) are DROPPED BY DEFAULT and only ingested if a target explicitly
+    lists the category in `optional_includes`. Fail-closed: a targets file with
+    no `optional_includes` key ingests none of them, so existing configs and
+    anything Apple adds in future are safe without being edited. Every drop is
+    logged (one WARN per run) so a silent block is never invisible.
   * Units are locale-dependent (kg/lb, km/mi) -> converted to SI (kg, meters).
   * Apple calls light sleep `core` -> mapped to light_min.
   * Per-minute heart_rate firehose is OFF by default (we already get
@@ -51,7 +57,7 @@ HERE = Path(__file__).resolve().parent
 _LOG_COMPONENT = "apple"
 # Fetcher version — BUMP on every fetcher change (repo-only, not in the .spl);
 # emitted as fetcher_ver= on the post-sink "run started" line for drift tracking.
-FETCHER_VERSION = "1.1.1"
+FETCHER_VERSION = "1.2.0"
 # Box running this fetcher (its OWN hostname — not Splunk's HEC `host`). Sent as
 # run_host= on run-started so Ingest Health shows which box/person to nudge to upgrade.
 import socket
@@ -260,6 +266,10 @@ def _norm_target(cfg):
         "person_id": cfg.get("person_id"),
         "verify_ssl": cfg.get("verify_ssl", True),
         "skip_sources": [s.lower() for s in cfg.get("skip_sources", [])],
+        # FAIL-CLOSED: a missing key means an EMPTY set (ingest none of the sensitive
+        # categories) — never "ingest everything". That is what makes every pre-existing
+        # targets file safe with no edit. Lowercased so "womanHealth"/"womanhealth" both work.
+        "optional_includes": {str(c).strip().lower() for c in cfg.get("optional_includes", [])},
         "hr_firehose": bool(cfg.get("hr_firehose", False)),
         "logging": cfg.get("logging"),
     }
@@ -380,6 +390,41 @@ def parse_dt(s):
     return dt.timestamp(), dt.strftime("%Y-%m-%d")
 
 
+# ------------------------------------------------------------------ sensitive-category gate
+# Privacy-sensitive metrics are dropped BEFORE mapping unless the target opts in via
+# `optional_includes`. This matters because unmapped metrics are otherwise ABSORBED into
+# apple:extra rather than ignored — so a new HealthKit identifier, or a Health Auto Export
+# automation someone enables on their phone, could start landing sensitive data in the index
+# with nobody in this code having decided that.
+#
+# SUBSTRING match on the lowercased name, deliberately, not an exact-name allowlist: HAE's
+# naming varies and Apple keeps adding identifiers (iOS 27 added menopausalState /
+# bleedingAfterMenopause). A name we've never seen should be BLOCKED by default, not absorbed,
+# so over-blocking is the intended bias — and every block is logged by name so an accidental
+# over-block is visible and can be opted back in.
+#
+# Scope note: this gate covers `data.metrics`. HAE exports Medications / Symptoms / State of
+# Mind / ECG / Menstrual as SEPARATE automations, and this puller only ever parses
+# `data.metrics` + `data.workouts`, so those other containers are already ignored entirely.
+# IF a future change starts parsing another container, it MUST be gated here too.
+SENSITIVE_CATEGORIES = {
+    "womanhealth": ("menstrual", "intermenstrual", "ovulation", "cervical", "contraceptive",
+                    "pregnan", "menopaus", "basal_body_temperature", "sexual_activity"),
+    "medicines":   ("medication", "prescription", "dose_event"),
+    "mentalhealth": ("state_of_mind", "mood"),
+    "symptoms":    ("symptom",),
+}
+
+
+def sensitive_category(name):
+    """Category this metric falls under, or None. Case/separator tolerant."""
+    n = (name or "").lower()
+    for cat, pats in SENSITIVE_CATEGORIES.items():
+        if any(p in n for p in pats):
+            return cat
+    return None
+
+
 # name -> (sourcetype, canonical_field, kind)
 # kinds: sum_daily, sum_daily_dist, avg_daily, avg_daily_pct,
 #        bodycomp, bodycomp_mass, bodycomp_pct, hr_firehose
@@ -415,12 +460,20 @@ def explode(payload, tgt):
     dayvit = collections.defaultdict(lambda: collections.defaultdict(list))  # values to avg
     events = []
     unmapped = set()
+    blocked = set()                         # (metric, category) dropped by the sensitive gate
     extra = collections.defaultdict(list)   # (metric, day, vendor) -> [values]; unmapped -> apple:extra
     extra_units = {}
 
     for metric in metrics:
         name = metric.get("name")
         units = metric.get("units")
+        # Sensitive-category gate FIRST — before sleep handling, before METRIC_MAP, and
+        # before the apple:extra catch-all, so a sensitive metric is dropped whether or
+        # not we have a mapping for it.
+        cat = sensitive_category(name)
+        if cat and cat not in tgt["optional_includes"]:
+            blocked.add((name, cat))
+            continue
         if name == "sleep_analysis":
             events += _sleep_events(metric, tgt)
             continue
@@ -496,6 +549,13 @@ def explode(payload, tgt):
     if unmapped:
         log_info("unmapped metrics routed to apple:extra", count=len(unmapped),
                  metrics=",".join(sorted(unmapped)))
+    if blocked:
+        # WARN, not INFO: a block is a deliberate privacy decision the operator should SEE.
+        # Names the categories so it is obvious what to add to optional_includes to allow it.
+        log_warn("sensitive metrics dropped (not in optional_includes)",
+                 count=len(blocked),
+                 metrics=",".join(sorted(n for n, _ in blocked)),
+                 categories=",".join(sorted({c for _, c in blocked})))
     return events
 
 

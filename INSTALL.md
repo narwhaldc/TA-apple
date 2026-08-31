@@ -1,6 +1,6 @@
 # TA-apple → Splunk — Installation Guide
 
-**App version:** TA-apple 0.1.4 · Apache-2.0 · Source: https://github.com/narwhaldc
+**App version:** TA-apple 0.1.5 · Apache-2.0 · Source: https://github.com/narwhaldc
 
 Ingest **Apple Health / HealthKit** into the canonical **Wearables** data model. HealthKit is
 on-device only (no cloud API), so the iOS app **Health Auto Export (HAE)** writes JSON export
@@ -105,8 +105,40 @@ Edit it: **`hec_url`** must be the **event** endpoint `https://<host>:8088/servi
 and **`watch_dir`** (the synced folder from step 2). Options: `skip_sources` (default empty =
 ingest everything, "Apple-hub" mode), `hr_firehose` (default off), `delete_after_ingest` /
 `archive_dir`, `min_file_age_seconds`, `file_glob` (default `*.json` — narrow it only if the
-watch dir also receives files you don't want ingested). (Alternatively set `SPLUNK_HEC_URL`/`SPLUNK_HEC_TOKEN` +
+watch dir also receives files you don't want ingested), and **`optional_includes`** (privacy gate,
+see below). (Alternatively set `SPLUNK_HEC_URL`/`SPLUNK_HEC_TOKEN` +
 `APPLE_WATCH_DIR`/`APPLE_PERSON_ID` in a gitignored `.env`.)
+
+### `optional_includes` — privacy-sensitive categories (default: none ingested)
+Some HealthKit data is materially more sensitive than steps and sleep. The puller **drops these
+categories before they ever reach Splunk** unless a target explicitly opts in:
+
+| Category | Covers |
+|---|---|
+| `womanHealth` | menstrual / reproductive / fertility / menopause |
+| `medicines` | medication logging (scheduled + as-needed doses) |
+| `mentalHealth` | State of Mind / mood |
+| `symptoms` | symptom logging |
+
+```json
+"optional_includes": []                          // default — none of it is ingested
+"optional_includes": ["womanHealth"]             // opt in to just that one
+```
+
+- **Fail-closed.** Omitting the key entirely behaves exactly like `[]`, so existing targets files
+  are safe with no edit, and a category Apple adds in future is blocked until someone chooses it.
+- **Per target, not per box.** Each target has its own setting, so on a shared ingest host one
+  person can opt in without affecting anyone else — and you can send a category to your private
+  Splunk while excluding it from a shared/demo one.
+- **Never silent.** Every run logs one `WARN` naming the exact metrics and categories it dropped.
+- **Matching is deliberately broad** (substring, not an exact-name list) so an unfamiliar new
+  identifier is blocked rather than absorbed. If that over-blocks something you want, the WARN
+  line tells you the category to add.
+
+> This is the **second** layer of defense, not the first. Prefer simply not enabling those data
+> types in the Health Auto Export automation (step 1) — and note Apple separately requires
+> **per-medication** access grants under **Health → Data Sources & Access**. The gate exists so
+> that a phone-side change can't quietly start feeding sensitive data into a shared index.
 
 ## 3b. Optional: mirror ingest logs to Splunk (Ingest Health dashboard)
 The puller always writes **logfmt** logs to **stderr** (`<ts> level=… comp=apple msg="…" …`) — add a
