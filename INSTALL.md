@@ -134,6 +134,13 @@ categories before they ever reach Splunk** unless a target explicitly opts in:
 - **Matching is deliberately broad** (substring, not an exact-name list) so an unfamiliar new
   identifier is blocked rather than absorbed. If that over-blocks something you want, the WARN
   line tells you the category to add.
+- **`medicines` is different from the other three.** HAE exports its "Medications" automation as
+  a completely separate top-level container (`data.medications`), not as named entries inside
+  `data.metrics` the way `womanHealth`/`mentalHealth`/`symptoms` are matched. It's gated on the
+  whole container at once (every record is inherently "medicines"), not by name-substring
+  matching. If you turn on a HAE Medications automation, it needs its own automation pointed at
+  the same watch folder as your Health Metrics export — the gate then works exactly the same way
+  once the file arrives, `optional_includes` per target either way.
 
 > This is the **second** layer of defense, not the first. Prefer simply not enabling those data
 > types in the Health Auto Export automation (step 1) — and note Apple separately requires

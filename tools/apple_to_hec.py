@@ -57,7 +57,7 @@ HERE = Path(__file__).resolve().parent
 _LOG_COMPONENT = "apple"
 # Fetcher version — BUMP on every fetcher change (repo-only, not in the .spl);
 # emitted as fetcher_ver= on the post-sink "run started" line for drift tracking.
-FETCHER_VERSION = "1.2.0"
+FETCHER_VERSION = "1.3.0"
 # Box running this fetcher (its OWN hostname — not Splunk's HEC `host`). Sent as
 # run_host= on run-started so Ingest Health shows which box/person to nudge to upgrade.
 import socket
@@ -403,10 +403,12 @@ def parse_dt(s):
 # so over-blocking is the intended bias — and every block is logged by name so an accidental
 # over-block is visible and can be opted back in.
 #
-# Scope note: this gate covers `data.metrics`. HAE exports Medications / Symptoms / State of
-# Mind / ECG / Menstrual as SEPARATE automations, and this puller only ever parses
-# `data.metrics` + `data.workouts`, so those other containers are already ignored entirely.
-# IF a future change starts parsing another container, it MUST be gated here too.
+# Scope note: HAE exports Medications / Symptoms / State of Mind / ECG / Menstrual as
+# SEPARATE automations, each its own top-level container outside `data.metrics`. This
+# puller parses `data.metrics` + `data.workouts` + `data.medications` (see
+# _medication_events, gated on "medicines" as a WHOLE container, not per-name-match).
+# Symptoms/State of Mind/ECG/Menstrual are still NOT parsed at all -- IF a future change
+# starts reading another container, it MUST be gated here too, the same way.
 SENSITIVE_CATEGORIES = {
     "womanhealth": ("menstrual", "intermenstrual", "ovulation", "cervical", "contraceptive",
                     "pregnan", "menopaus", "basal_body_temperature", "sexual_activity"),
@@ -546,6 +548,7 @@ def explode(payload, tgt):
             "day": day, "_vendor": vendor}))
 
     events += _workout_events((payload.get("data") or {}).get("workouts") or [], tgt)
+    events += _medication_events((payload.get("data") or {}).get("medications") or [], tgt)
     if unmapped:
         log_info("unmapped metrics routed to apple:extra", count=len(unmapped),
                  metrics=",".join(sorted(unmapped)))
@@ -666,6 +669,50 @@ def _midnight(day):
 
 
 # ------------------------------------------------------------------ HEC
+def _medication_events(meds, tgt):
+    """HAE 'Medications' automation -> one apple:medications event per record.
+
+    This is a SEPARATE top-level container (payload.data.medications), not part
+    of data.metrics, so it's gated as a WHOLE (not per-record name-matching like
+    SENSITIVE_CATEGORIES does for named metrics) -- every record here is
+    inherently the "medicines" category. Reuses the same optional_includes gate
+    and warning-log convention as the metrics-based sensitive categories.
+    """
+    out = []
+    if "medicines" not in tgt["optional_includes"]:
+        if meds:
+            log_warn("sensitive metrics dropped (not in optional_includes)",
+                     count=len(meds), metrics="medications", categories="medicines")
+        return out
+    for m in meds:
+        # 'start'/'end' are when the dose was LOGGED (identical for a point-in-time
+        # "Taken" action); 'scheduledDate' is when it was DUE. The event's own time
+        # is the logged moment; scheduled_time is kept as a field so scheduled-vs-
+        # actual can be compared in Splunk.
+        epoch, day = parse_dt(m.get("start") or m.get("scheduledDate"))
+        sched_epoch, _ = parse_dt(m.get("scheduledDate"))
+        rxnorm = None
+        for c in (m.get("codings") or []):
+            if isinstance(c, dict) and "rxnorm" in str(c.get("system", "")).lower():
+                rxnorm = c.get("code")
+                break
+        ev = {
+            "medication_name": m.get("displayText"),
+            "status": m.get("status"),
+            "dosage": m.get("dosage"),
+            "scheduled_dosage": m.get("scheduledDosage"),
+            "dosage_units": m.get("units"),
+            "scheduled_time": sched_epoch,
+            "is_archived": bool(m.get("isArchived", False)),
+            "day": day,
+            "_vendor": "apple",
+        }
+        if rxnorm:
+            ev["rxnorm_code"] = rxnorm
+        out.append(("apple:medications", epoch, ev))
+    return out
+
+
 def to_hec(tgt, sourcetype, epoch, ev):
     vendor = ev.pop("_vendor", "apple")
     return {"time": epoch if epoch else time.time(), "event": ev, "sourcetype": sourcetype,
@@ -775,15 +822,36 @@ def main():
         except OSError: pass
     atexit.register(_release_lock)
 
-    configure_hec_log(load_logging_cfg(), targets, args.dry_run)
-    files = [Path(args.file)] if args.file else discover_files(source)
+    try:
+        sync(source, targets, file_override=args.file, dry_run=args.dry_run, keep=args.keep)
+    except Exception:
+        # sync() already logged the failure via log_error before re-raising
+        sys.exit(1)
+
+
+def sync(source, targets, file_override=None, dry_run=False, keep=False):
+    """
+    Run one Apple Health ingest pass (discover-or-use-file, explode, per-target
+    dedup+send, archive/delete) and return {"sent", "skipped", "files", "failed"}.
+
+    Extracted out of main() so a future master orchestrator (or an
+    embedded-interpreter mobile build) can call this directly in-process for
+    one vendor among several. main() still does argparse, --status/
+    --reset-dedup handling, the --person testing override, and the
+    single-instance file lock; this assumes all of that already happened and
+    `source`/`targets` are the final resolved values (including any --person
+    override already applied).
+    """
+    store = load_json(DEDUP_FILE, {})
+    configure_hec_log(load_logging_cfg(), targets, dry_run)
+    files = [Path(file_override)] if file_override else discover_files(source)
     t0 = time.time()
     log_info("run started", fetcher_ver=FETCHER_VERSION, run_host=RUN_HOST, watch_dir=source["watch_dir"], targets=len(targets),
-             files=len(files), dry_run=args.dry_run)
+             files=len(files), dry_run=dry_run)
     if not files:
         log_info("run complete", events=0, skipped=0, files=0, failures=0, targets=len(targets),
-                 duration_s=round(time.time() - t0, 1), dry_run=args.dry_run)
-        return
+                 duration_s=round(time.time() - t0, 1), dry_run=dry_run)
+        return {"sent": 0, "skipped": 0, "files": 0, "failed": 0}
 
     total_sent = total_skip = failed = 0
     try:
@@ -807,7 +875,7 @@ def main():
                 sent_here = 0
                 for i in range(0, len(batch), 200):
                     chunk = batch[i:i+200]
-                    if args.dry_run:
+                    if dry_run:
                         continue
                     try:
                         hec_send(tgt, [e for _, e in chunk])
@@ -820,21 +888,21 @@ def main():
                     sent_here += len(chunk); total_sent += len(chunk)
                 log_info("sent events", person_id=tgt.get("person_id"), target=tname, file=p.name,
                          events=len(events), new=len(batch), count=sent_here)
-            if file_ok and not args.dry_run:
-                finish_file(source, p, dry=args.keep)
-                if not args.keep:
+            if file_ok and not dry_run:
+                finish_file(source, p, dry=keep)
+                if not keep:
                     log_info("finished file", file=p.name,
                              action=("archived" if source["archive_dir"] else "deleted"))
     except Exception as e:
         log_error("run failed", error=type(e).__name__, detail=str(e),
                   duration_s=round(time.time() - t0, 1))
-        sys.exit(1)
+        raise
 
     # prune + persist dedup store
     for n, d in store.items():
         if len(d) > DEDUP_MAX:
             store[n] = dict(list(d.items())[-DEDUP_MAX:])
-    if not args.dry_run:
+    if not dry_run:
         save_json(DEDUP_FILE, store)
     # Discovery: one WARN per unknown relayed source this run (promote into VENDOR_KEYWORDS).
     for src, n in sorted(_UNKNOWN_SOURCES.items(), key=lambda kv: -kv[1]):
@@ -842,7 +910,9 @@ def main():
                  via="apple", points=n)
     log_info("run complete", events=total_sent, skipped=total_skip, files=len(files),
              failures=failed, targets=len(targets), duration_s=round(time.time() - t0, 1),
-             dry_run=args.dry_run)
+             dry_run=dry_run)
+    flush_hec_log()
+    return {"sent": total_sent, "skipped": total_skip, "files": len(files), "failed": failed}
 
 
 if __name__ == "__main__":
