@@ -1,6 +1,6 @@
 # TA-apple → Splunk — Installation Guide
 
-**App version:** TA-apple 0.1.5 · Apache-2.0 · Source: https://github.com/narwhaldc
+**App version:** TA-apple 0.1.6 · Apache-2.0 · Source: https://github.com/narwhaldc
 
 Ingest **Apple Health / HealthKit** into the canonical **Wearables** data model. HealthKit is
 on-device only (no cloud API), so the iOS app **Health Auto Export (HAE)** writes JSON export
