@@ -57,7 +57,7 @@ HERE = Path(__file__).resolve().parent
 _LOG_COMPONENT = "apple"
 # Fetcher version — BUMP on every fetcher change (repo-only, not in the .spl);
 # emitted as fetcher_ver= on the post-sink "run started" line for drift tracking.
-FETCHER_VERSION = "1.3.0"
+FETCHER_VERSION = "1.3.1"
 # Box running this fetcher (its OWN hostname — not Splunk's HEC `host`). Sent as
 # run_host= on run-started so Ingest Health shows which box/person to nudge to upgrade.
 import socket
@@ -306,7 +306,8 @@ def _hash(obj):
 # ------------------------------------------------------------------ mapping helpers
 VENDOR_KEYWORDS = [("oura", "oura"), ("garmin", "garmin"), ("withings", "withings"),
                    ("fitbit", "fitbit"), ("whoop", "whoop"), ("polar", "polar"),
-                   ("wahoo", "wahoo"), ("peloton", "peloton"), ("hume", "hume")]
+                   ("wahoo", "wahoo"), ("peloton", "peloton"), ("hume", "hume"),
+                   ("cronometer", "cronometer")]
 
 # Genuine Apple-native sources (Apple Watch / iPhone / built-in apps) legitimately map to
 # vendor=apple. Anything NOT a known third-party (VENDOR_KEYWORDS) and NOT apple-native is
