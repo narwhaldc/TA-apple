@@ -57,7 +57,7 @@ HERE = Path(__file__).resolve().parent
 _LOG_COMPONENT = "apple"
 # Fetcher version — BUMP on every fetcher change (repo-only, not in the .spl);
 # emitted as fetcher_ver= on the post-sink "run started" line for drift tracking.
-FETCHER_VERSION = "1.3.1"
+FETCHER_VERSION = "1.4.0"
 # Box running this fetcher (its OWN hostname — not Splunk's HEC `host`). Sent as
 # run_host= on run-started so Ingest Health shows which box/person to nudge to upgrade.
 import socket
@@ -404,12 +404,15 @@ def parse_dt(s):
 # so over-blocking is the intended bias — and every block is logged by name so an accidental
 # over-block is visible and can be opted back in.
 #
-# Scope note: HAE exports Medications / Symptoms / State of Mind / ECG / Menstrual as
-# SEPARATE automations, each its own top-level container outside `data.metrics`. This
-# puller parses `data.metrics` + `data.workouts` + `data.medications` (see
-# _medication_events, gated on "medicines" as a WHOLE container, not per-name-match).
-# Symptoms/State of Mind/ECG/Menstrual are still NOT parsed at all -- IF a future change
-# starts reading another container, it MUST be gated here too, the same way.
+# Scope note: HAE exports Medications / Symptoms / State of Mind / ECG / Menstrual /
+# Heart Rate Notifications as SEPARATE automations, each its own top-level container
+# outside `data.metrics`. This puller parses `data.metrics` + `data.workouts` +
+# `data.medications` (see _medication_events, gated on "medicines" as a WHOLE
+# container, not per-name-match) + `data.heartRateNotifications` (see
+# _heart_rate_notification_events -- NOT privacy-sensitive, so ungated, unlike
+# medications). Symptoms/State of Mind/ECG/Menstrual are still NOT parsed at all --
+# IF a future change starts reading another container, it MUST be gated here too,
+# the same way (unless it's confirmed non-sensitive like heart rate notifications).
 SENSITIVE_CATEGORIES = {
     "womanhealth": ("menstrual", "intermenstrual", "ovulation", "cervical", "contraceptive",
                     "pregnan", "menopaus", "basal_body_temperature", "sexual_activity"),
@@ -550,6 +553,7 @@ def explode(payload, tgt):
 
     events += _workout_events((payload.get("data") or {}).get("workouts") or [], tgt)
     events += _medication_events((payload.get("data") or {}).get("medications") or [], tgt)
+    events += _heart_rate_notification_events((payload.get("data") or {}).get("heartRateNotifications") or [], tgt)
     if unmapped:
         log_info("unmapped metrics routed to apple:extra", count=len(unmapped),
                  metrics=",".join(sorted(unmapped)))
@@ -711,6 +715,49 @@ def _medication_events(meds, tgt):
         if rxnorm:
             ev["rxnorm_code"] = rxnorm
         out.append(("apple:medications", epoch, ev))
+    return out
+
+
+def _heart_rate_notification_events(records, tgt):
+    """HAE 'Heart Rate Notifications' automation -> one apple:heart_notification event
+    per record (High/Low HR alerts and Irregular Rhythm/AFib alerts).
+
+    Separate top-level container (payload.data.heartRateNotifications), not part of
+    data.metrics -- same shape of container as _medication_events(). NOT privacy-
+    sensitive (not in SENSITIVE_CATEGORIES), so no optional_includes gate: always
+    processed when present.
+
+    HAE gives NO explicit alert-type field here -- type must be INFERRED from the
+    record shape: 'threshold' present + peak hr at/above it -> high; 'threshold'
+    present + peak hr below it -> low; 'threshold' absent entirely -> irregular
+    rhythm/AFib. This inference was reverse-engineered from HAE's own published
+    JSON schema (help.healthyapps.dev), NOT verified against a real record as of
+    2026-09-24 -- re-check this logic the first time an actual alert fires.
+    """
+    out = []
+    for r in records:
+        epoch, day = parse_dt(r.get("start"))
+        end_epoch, _ = parse_dt(r.get("end"))
+        hr_samples = [s.get("hr") for s in (r.get("heartRate") or [])
+                      if isinstance(s.get("hr"), (int, float))]
+        hrv_samples = [s.get("hrv") for s in (r.get("heartRateVariation") or [])
+                       if isinstance(s.get("hrv"), (int, float))]
+        threshold = r.get("threshold")
+        peak_hr = max(hr_samples) if hr_samples else None
+        if threshold is not None and peak_hr is not None:
+            alert_type = "high" if peak_hr >= threshold else "low"
+        else:
+            alert_type = "irregular"
+        ev = {
+            "alert_type": alert_type,
+            "peak_hr": peak_hr,
+            "threshold": threshold,
+            "avg_hrv": round(sum(hrv_samples) / len(hrv_samples), 1) if hrv_samples else None,
+            "duration_s": (end_epoch - epoch) if (epoch and end_epoch) else None,
+            "day": day,
+            "_vendor": "apple",
+        }
+        out.append(("apple:heart_notification", epoch, {k: v for k, v in ev.items() if v is not None}))
     return out
 
 

@@ -1,6 +1,6 @@
 # TA-apple → Splunk — Installation Guide
 
-**App version:** TA-apple 0.1.7 · Apache-2.0 · Source: https://github.com/narwhaldc
+**App version:** TA-apple 0.1.8 · Apache-2.0 · Source: https://github.com/narwhaldc
 
 Ingest **Apple Health / HealthKit** into the canonical **Wearables** data model. HealthKit is
 on-device only (no cloud API), so the iOS app **Health Auto Export (HAE)** writes JSON export
@@ -146,6 +146,25 @@ categories before they ever reach Splunk** unless a target explicitly opts in:
 > types in the Health Auto Export automation (step 1) — and note Apple separately requires
 > **per-medication** access grants under **Health → Data Sources & Access**. The gate exists so
 > that a phone-side change can't quietly start feeding sensitive data into a shared index.
+
+### Heart Rate Notifications — High/Low HR + Irregular Rhythm (AFib) alerts
+HAE exports **High Heart Rate**, **Low Heart Rate**, and **Irregular Rhythm (AFib)** notifications
+together as one automation, a separate top-level container (`data.heartRateNotifications`) from
+Health Metrics — same shape as Medications above, but **not privacy-sensitive**, so it's always
+ingested when present (no `optional_includes` entry needed). To get this data flowing, **two
+independent things need to be on**, and each is genuinely separate — turning one on does not turn
+on the other:
+1. **On the Watch/iPhone**: Health app → Heart → the High/Low Heart Rate Notification toggles
+   (two separate switches), and separately **AFib History** under Heart (needed for irregular
+   rhythm detection at all — requires Apple Watch Series 4+ or Ultra with the ECG sensor).
+2. **In Health Auto Export**: add a **Heart Rate Notifications** automation pointed at the same
+   watch folder as your other exports (same pattern as the Medications automation above).
+
+> **HAE gives no explicit alert-type field** — the puller infers High vs. Low vs. Irregular from
+> whether a `threshold` key is present and how the recorded heart rate compares to it (see
+> `_heart_rate_notification_events()` in `apple_to_hec.py`). This inference was built from HAE's
+> published export schema, not a real alert (none had fired as of this writing) — if your first
+> real alert classifies wrong, that function's logic needs a fix, not just a field-name tweak.
 
 ## 3b. Optional: mirror ingest logs to Splunk (Ingest Health dashboard)
 The puller always writes **logfmt** logs to **stderr** (`<ts> level=… comp=apple msg="…" …`) — add a
